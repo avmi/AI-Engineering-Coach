@@ -29,8 +29,9 @@ import {
   recordCreatedContent,
 } from './edit-tool-diff';
 import { recordedInvestigation, recordedWebDomains } from './curiosity-activity';
-import { imageReferencesFromContent, type ImageCollector } from './image-data';
+import { imageReferencesFromContent, type ImageReference, type ImageRequestMatch } from './image-data';
 import type { SessionSource } from './cache';
+import { forEachJsonlLine } from './parser-vscode-files';
 
 interface ClaudeContentBlock {
   type: string;
@@ -239,6 +240,40 @@ function getClaudeUserText(line: ClaudeLine): string {
 
 function countClaudeImages(line: ClaudeLine): number {
   return imageReferencesFromContent(line.message?.content).length;
+}
+
+export function extractClaudeImageReferences(
+  filePath: string,
+  requestId: string,
+  match?: ImageRequestMatch,
+): { images: ImageReference[]; workspaceRootPath?: string } {
+  let sessionId = path.basename(filePath, '.jsonl');
+  let firstLine = true;
+  let requestIndex = 0;
+  let workspaceRootPath: string | undefined;
+  let images: ImageReference[] = [];
+  let found = false;
+  let done = false;
+  forEachJsonlLine(filePath, raw => {
+    if (!firstLine && !raw.includes('"user"')) return;
+    const line = parseClaudeLine(raw);
+    if (!line) return;
+    if (firstLine) {
+      sessionId = line.sessionId || sessionId;
+      firstLine = false;
+    }
+    if (line.type !== 'user' || !userHasText(line)) return;
+    if (!workspaceRootPath && line.cwd) workspaceRootPath = line.cwd;
+    const id = line.uuid || `${line.sessionId ?? sessionId}:claude:${requestIndex}`;
+    requestIndex++;
+    if (!found && (match?.userEventId ? line.uuid === match.userEventId : id === requestId)) {
+      images = imageReferencesFromContent(line.message?.content);
+      found = true;
+    }
+    const needsRoot = images.some(image => image.path && !path.isAbsolute(image.path) && !/^[a-z][a-z0-9+.-]*:/i.test(image.path));
+    done = found && (workspaceRootPath !== undefined || !needsRoot);
+  }, () => done);
+  return { images, workspaceRootPath };
 }
 
 function applyClaudeToolBlock(
@@ -747,7 +782,6 @@ export function parseClaudeSessionFile(
   wsId: string,
   wsName: string,
   editLocIndex?: EditLocIndex,
-  collectImages?: ImageCollector,
 ): Session | null {
   assertTrustedPath(filePath);
   let raw: string;
@@ -787,7 +821,6 @@ export function parseClaudeSessionFile(
     const assistantData = collectClaudeAssistantData(lines, i + 1, lastTs);
     lastTs = assistantData.lastTs;
     const request = buildClaudeRequest(line, assistantData, userTs, requests.length, sessionId, editLocIndex);
-    collectImages?.(request.requestId, imageReferencesFromContent(line.message?.content));
     requests.push(request);
     i = assistantData.nextIndex;
   }

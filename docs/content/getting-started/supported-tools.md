@@ -61,7 +61,7 @@ Image extraction runs in the existing parse worker, not on the extension-host th
 
 Full session details are also reloaded in the parse worker. OpenCode detail reloads read only the selected session's metadata, messages, and parts rather than parsing every stored session.
 
-Copilot CLI/App attachments are matched using the original user-event identity, so later assistant replies do not make a cached moment disappear. Older records without a user-event ID use their recorded turn position. CLI and Codex image reads stop at the requested turn without rebuilding full session requests or analyzing unrelated tool output.
+Copilot CLI/App attachments are matched using the original user-event identity, so later assistant replies do not make a cached moment disappear. Older records without a user-event ID use their recorded turn position. CLI, Claude, and Codex use targeted image reads rather than rebuilding full session requests or analyzing unrelated tool output.
 
 An attachment can still be counted when its original file has been deleted, its payload was not retained, or it exceeds the size limit. Such attachments cannot be displayed. Remote image URLs and network shares are never fetched, and SVG content is not rendered. Session logs and attachment files are never modified.
 

@@ -16,8 +16,6 @@ export interface ImageReference {
   alternatives?: ImageReference[];
 }
 
-export type ImageCollector = (requestId: string, images: ImageReference[]) => void;
-
 export interface ImageRequestMatch {
   userEventId?: string;
   requestIndex?: number;

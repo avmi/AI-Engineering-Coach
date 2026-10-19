@@ -32,7 +32,7 @@ import {
   recordCreatedContent,
 } from './edit-tool-diff';
 import { recordedToolFiles, recordedInvestigation, recordedWebDomains } from './curiosity-activity';
-import { imageReferencesFromCodex, imageRequestIndex, mergeImageReferences, type ImageCollector, type ImageReference, type ImageRequestMatch } from './image-data';
+import { imageReferencesFromCodex, imageRequestIndex, mergeImageReferences, type ImageReference, type ImageRequestMatch } from './image-data';
 import type { SessionSource } from './cache';
 import { forEachJsonlLine } from './parser-vscode-files';
 
@@ -72,7 +72,6 @@ interface CodexParseState {
   currentImages: ImageReference[];
   hasUserResponseItem: boolean;
   hasUserMessageEvent: boolean;
-  collectImages?: ImageCollector;
   imageScan?: CodexImageScan;
   currentAssistantTexts: string[];
   currentToolsUsed: string[];
@@ -156,7 +155,7 @@ function projectNameFromCwd(cwd: string): string {
   return cwd.replaceAll('\\', '/').replace(/\/+$/, '').split('/').pop() || 'unknown';
 }
 
-function createCodexState(initialModel: string, editLocIndex?: EditLocIndex, collectImages?: ImageCollector): CodexParseState {
+function createCodexState(initialModel: string, editLocIndex?: EditLocIndex): CodexParseState {
   return {
     requests: [],
     firstTs: null,
@@ -166,7 +165,6 @@ function createCodexState(initialModel: string, editLocIndex?: EditLocIndex, col
     currentImages: [],
     hasUserResponseItem: false,
     hasUserMessageEvent: false,
-    collectImages,
     currentAssistantTexts: [],
     currentToolsUsed: [],
     investigationDelegations: [],
@@ -265,7 +263,6 @@ function flushCodexTurn(state: CodexParseState, defaultModel: string): void {
   state.prevTotalOutput = state.curTotalOutput;
 
   const requestId = `${state.sessionId || 'unknown'}:codex:${state.requests.length}`;
-  state.collectImages?.(requestId, state.currentImages);
   state.requests.push(createRequest({
     requestId,
     timestamp: state.turnStartTs,
@@ -427,7 +424,7 @@ function collectCodexImages(payload: Record<string, unknown>, state: CodexParseS
   // A turn can be recorded as both event_msg and response_item. They describe
   // the same attachments, not two separate sets of screenshots.
   state.currentImageCount = Math.max(state.currentImageCount, images.length);
-  if (state.collectImages || state.imageScan) state.currentImages = mergeImageReferences(state.currentImages, images);
+  if (state.imageScan) state.currentImages = mergeImageReferences(state.currentImages, images);
 }
 
 function prepareCodexUserTurn(
@@ -747,7 +744,7 @@ function findAllJsonlFiles(dir: string): string[] {
   return result;
 }
 
-export function parseCodexSessionFile(filePath: string, editLocIndex?: EditLocIndex, collectImages?: ImageCollector): Session | null {
+export function parseCodexSessionFile(filePath: string, editLocIndex?: EditLocIndex): Session | null {
   assertTrustedPath(filePath);
   const meta: CodexSessionMeta = {
     sessionId: path.basename(filePath, '.jsonl'),
@@ -755,7 +752,7 @@ export function parseCodexSessionFile(filePath: string, editLocIndex?: EditLocIn
     source: '',
     model: '',
   };
-  const state = createCodexState('', editLocIndex, collectImages);
+  const state = createCodexState('', editLocIndex);
   state.sessionId = meta.sessionId;
   let parsedLineCount = 0;
 

@@ -7,13 +7,13 @@ import * as path from 'path';
 import type { SessionSource } from './cache';
 import type { Session } from './types';
 import { extractCLIImageReferences, parseCLIEventsFile } from './parser-vscode-cli';
-import { parseClaudeSessionFile } from './parser-claude';
+import { extractClaudeImageReferences, parseClaudeSessionFile } from './parser-claude';
 import { extractCodexImageReferences, parseCodexSessionFile } from './parser-codex';
 import { loadOpenCodeSession, readOpenCodeImageReferences } from './parser-opencode';
 import { loadXcodeSession, readXcodeImageReferences } from './parser-xcode';
 import { parseSessionFile } from './parser-vscode';
 import { extractSessionImages } from './parser-vscode-files';
-import { loadImageReferences, type ImageCollector, type ImageReference, type ImageRequestMatch } from './image-data';
+import { loadImageReferences, type ImageReference, type ImageRequestMatch } from './image-data';
 
 export interface SessionImagesRequest extends ImageRequestMatch {
   type: 'session-images';
@@ -66,9 +66,6 @@ export function loadSourceSession(source: SessionSource, sessionId: string): Ses
 /** Runs in the parse worker; raw payloads never enter the analytics cache. */
 export function extractSourceImages(source: SessionSource, sessionId: string, requestId: string, match?: ImageRequestMatch): string[] {
   let references: ImageReference[] = [];
-  const collect: ImageCollector = (id, images) => {
-    if (id === requestId) references = images;
-  };
   switch (source.kind) {
     case 'vscode-session-file':
       return extractSessionImages(source.filePath, requestId, source.workspaceRootPath);
@@ -80,8 +77,10 @@ export function extractSourceImages(source: SessionSource, sessionId: string, re
       break;
     case 'claude-jsonl':
       for (const file of [source.filePath, ...source.additionalFilePaths ?? []]) {
-        const session = parseClaudeSessionFile(file, source.workspaceId, source.workspaceName, undefined, collect);
-        if (references.length > 0) return loadImageReferences(references, path.dirname(file), session?.workspaceRootPath);
+        const result = extractClaudeImageReferences(file, requestId, match);
+        if (result.images.length > 0) {
+          return loadImageReferences(result.images, path.dirname(file), result.workspaceRootPath ?? source.workspaceRootPath);
+        }
       }
       return [];
     case 'opencode-storage':

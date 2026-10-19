@@ -25,7 +25,7 @@ import {
   recordCreatedContent,
 } from './edit-tool-diff';
 import { recordedTools, recordedToolFiles, recordedInvestigation, recordedWebDomains } from './curiosity-activity';
-import { imageReferencesFromAttachments, imageReferencesFromVariables, imageRequestIndex, type ImageCollector, type ImageReference, type ImageRequestMatch } from './image-data';
+import { imageReferencesFromAttachments, imageReferencesFromVariables, imageRequestIndex, type ImageReference, type ImageRequestMatch } from './image-data';
 
 interface CLIEvent {
   type: string;
@@ -65,7 +65,6 @@ interface TurnState {
   compaction: CompactionEvent | null;
   reasoningEffort: 'max' | 'high' | 'medium' | 'low' | null;
   imageCount: number;
-  images?: ImageReference[];
   editLocs: FileEditLocMap;
   pendingToolEdits: Map<string, PendingToolEdit>;
 }
@@ -88,7 +87,6 @@ interface CLIParseState {
   requests: SessionRequest[];
   turn: TurnState | null;
   editLocIndex?: EditLocIndex;
-  collectImages?: ImageCollector;
 }
 
 function freshTurn(userMsg: string, userTs: string | null, agentMode: string, reasoningEffort: 'max' | 'high' | 'medium' | 'low' | null): TurnState {
@@ -180,7 +178,6 @@ function flushTurn(state: CLIParseState): void {
   const responseText = turn.responseChunks.filter(Boolean).join('\n\n');
 
   const requestId = turn.lastAssistantId || `${state.sessionId}:cli:${state.requests.length}`;
-  state.collectImages?.(requestId, turn.images ?? []);
   state.requests.push(createRequest({
     requestId,
     userEventId: turn.userEventId,
@@ -258,7 +255,6 @@ function handleUserMessage(ev: CLIEvent, state: CLIParseState): void {
     ...imageReferencesFromVariables(ev.data?.variables),
   ];
   state.turn.imageCount = images.length;
-  if (state.collectImages) state.turn.images = images;
 }
 
 function handleToolExecutionStart(ev: CLIEvent, state: CLIParseState): void {
@@ -460,7 +456,7 @@ function handleCliEvent(ev: CLIEvent, state: CLIParseState, wsId: string): void 
   }
 }
 
-function createInitialCliState(wsId: string, editLocIndex?: EditLocIndex, collectImages?: ImageCollector): CLIParseState {
+function createInitialCliState(wsId: string, editLocIndex?: EditLocIndex): CLIParseState {
   return {
     sessionId: wsId,
     isApp: false,
@@ -472,7 +468,6 @@ function createInitialCliState(wsId: string, editLocIndex?: EditLocIndex, collec
     requests: [],
     turn: null,
     editLocIndex,
-    collectImages,
   };
 }
 
@@ -509,9 +504,8 @@ export function parseCLIEventsFile(
   wsName: string,
   customInstructionsBytes?: number,
   editLocIndex?: EditLocIndex,
-  collectImages?: ImageCollector,
 ): Session | null {
-  const state = createInitialCliState(wsId, editLocIndex, collectImages);
+  const state = createInitialCliState(wsId, editLocIndex);
 
   let sawAnyEvent = false;
   try {

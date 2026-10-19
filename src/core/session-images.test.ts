@@ -186,26 +186,33 @@ describe('harness-aware image loading', () => {
     expect(extractSourceImages(source, 'legacy', cached.requestId, { requestIndex: 1 })).toEqual([image]);
   });
 
-  it.each(['cli', 'codex'])('extracts 30 %s image moments without rebuilding any normalized requests', harness => {
+  it.each(['cli', 'codex', 'claude'])('extracts 30 %s image moments without rebuilding any normalized requests', harness => {
     const lines: object[] = harness === 'cli'
       ? [{ type: 'session.start', data: { sessionId: 'many-images' } }]
-      : [{ type: 'session_meta', payload: { id: 'many-images', cwd: root } }];
+      : harness === 'codex' ? [{ type: 'session_meta', payload: { id: 'many-images', cwd: root } }]
+        : [{ type: 'queue-operation', sessionId: 'many-images' }];
     for (let index = 0; index < 30; index++) {
       if (harness === 'cli') {
         lines.push(
           { type: 'user.message', id: `user-${index}`, data: { content: `Screenshot ${index}`, variables: [{ kind: 'image', value: image }] } },
           { type: 'assistant.message', id: `answer-${index}`, data: { content: 'Done' } },
         );
-      } else {
+      } else if (harness === 'codex') {
         lines.push(
           { type: 'response_item', payload: { role: 'user', content: [{ type: 'input_text', text: `Screenshot ${index}` }, { type: 'input_image', image_url: image }] } },
           { type: 'response_item', payload: { role: 'assistant', type: 'message', content: [{ type: 'output_text', text: 'Done' }] } },
         );
+      } else {
+        lines.push(
+          claudeUser(`user-${index}`, [{ type: 'text', text: `Screenshot ${index}` }, claudeImage()], 'many-images'),
+          { type: 'assistant', sessionId: 'many-images', message: { role: 'assistant', content: [{ type: 'text', text: 'Done' }] } },
+        );
       }
     }
-    const file = jsonl(path.join(root, harness, 'events.jsonl'), lines);
+    const file = jsonl(path.join(root, harness, ...(harness === 'claude' ? ['project'] : []), 'events.jsonl'), lines);
     const session = harness === 'cli' ? parseCLIEventsFile(file, 'ws', 'WS')!
-      : parseCodexSessions(path.dirname(file), undefined, sources)[0];
+      : harness === 'codex' ? parseCodexSessions(path.dirname(file), undefined, sources)[0]
+        : parseClaudeSessions(path.dirname(path.dirname(file)), undefined, sources)[0].sessions[0];
     const source: SessionSource = harness === 'cli'
       ? { kind: 'cli-events', filePath: file, workspaceId: 'ws', workspaceName: 'WS', harness: 'Copilot' }
       : sources.get(session.sessionId)!;
@@ -216,6 +223,26 @@ describe('harness-aware image loading', () => {
         .toEqual([image]);
     }
     expect(createRequest).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('preserves generated Claude IDs and relative image roots (cwd follows image=%s)', rootAfterImage => {
+    const projects = path.join(root, 'claude-relative');
+    const workspace = path.join(root, 'actual-workspace');
+    fs.mkdirSync(workspace);
+    fs.writeFileSync(path.join(workspace, 'screenshot.png'), Buffer.from(base64, 'base64'));
+    jsonl(path.join(projects, 'project', 'session.jsonl'), [
+      { type: 'queue-operation', sessionId: 'generated' },
+      { type: 'user', sessionId: 'generated', ...(!rootAfterImage ? { cwd: workspace } : {}), message: { role: 'user', content: 'Earlier text turn' } },
+      { type: 'user', sessionId: 'generated', ...(!rootAfterImage ? { cwd: workspace } : {}), message: {
+        role: 'user', content: [{ type: 'image', source: { type: 'url', url: 'screenshot.png' } }],
+      } },
+      ...(rootAfterImage ? [{ type: 'user', sessionId: 'generated', cwd: workspace, message: { role: 'user', content: 'Later text turn' } }] : []),
+    ]);
+    const session = parseClaudeSessions(projects, undefined, sources)[0].sessions[0];
+    const source = { ...sources.get(session.sessionId)!, workspaceRootPath: path.join(root, 'parent-workspace') };
+    expect(session.requests[1].requestId).toBe('generated:claude:1');
+    expect(extractSourceImages(source, session.sessionId, 'generated:claude:1')).toEqual([image]);
+    expect(extractSourceImages(source, session.sessionId, 'missing')).toEqual([]);
   });
 
   it('keeps targeted Codex image selection aligned with orphan replies, tools, tokens, mirrors, and aborted turns', () => {
@@ -277,7 +304,9 @@ describe('harness-aware image loading', () => {
     expect(sources.get('claude-session')?.additionalFilePaths).toHaveLength(1);
     for (const [sessionId, requestId] of [['claude-session', 'claude-image'], ['claude-session', 'child-image'], ['orphan', 'orphan-image']]) {
       const source = sources.get(sessionId)!;
+      vi.mocked(createRequest).mockClear();
       expect(extractSourceImages(source, sessionId, requestId)).toEqual([image]);
+      expect(createRequest).not.toHaveBeenCalled();
       expect(loadSourceSession(source, sessionId)?.requests.some(request => request.requestId === requestId)).toBe(true);
       expect(extractSourceImages(source, sessionId, 'unknown')).toEqual([]);
     }
