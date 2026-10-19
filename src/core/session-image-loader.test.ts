@@ -125,9 +125,13 @@ describe('image worker lifecycle', () => {
         { type: 'user.message', id: 'user', data: { content: 'Screenshot', variables: [{ kind: 'image', data: [...Buffer.from(base64, 'base64')] }] } },
         { type: 'assistant.message', id: 'answer', data: { content: 'Done' } },
       ].map(event => JSON.stringify(event)).join('\n'));
-      const loader = new SessionImageLoader(() => new Worker(workerPath, { execArgv: [] }));
+      const worker = new Worker(workerPath, { execArgv: [] });
+      const loader = new SessionImageLoader(() => worker);
       loaders.push(loader);
       expect(await loader.load({ ...source, filePath: events }, 'session', 'answer')).toEqual([`data:image/png;base64,${base64}`]);
+      const invalid = new Promise<unknown>(resolve => worker.once('message', resolve));
+      worker.postMessage({ type: 'session-detail', source: null, sessionId: 'session' });
+      expect(await invalid).toEqual({ type: 'error', message: 'Invalid session source request' });
       expect(await loader.load({ ...source, filePath: events }, 'session', 'unknown')).toEqual([]);
       expect(await loader.loadSession({ ...source, filePath: events }, 'session')).toMatchObject({
         sessionId: 'session',

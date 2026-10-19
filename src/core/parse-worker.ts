@@ -75,8 +75,7 @@ function isAckMessage(msg: unknown): msg is AckMessage {
 /** Set by the streaming step to receive chunk acks from the parent. */
 let onAck: ((seq: number) => void) | null = null;
 
-function isSessionSourceRequest(value: unknown): value is SessionSourceRequest {
-  if (typeof value !== 'object' || value === null) return false;
+function isSessionSourceRequest(value: object): value is SessionSourceRequest {
   const candidate = value as Partial<SessionSourceRequest>;
   const source = candidate.source;
   return (candidate.type === 'session-detail' || (candidate.type === 'session-images' && typeof candidate.requestId === 'string'))
