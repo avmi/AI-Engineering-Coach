@@ -34,6 +34,8 @@ vi.mock('./session-image-loader', () => ({
 
 const base64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==';
 const image = `data:image/png;base64,${base64}`;
+const alternateBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=';
+const alternateImage = `data:image/png;base64,${alternateBase64}`;
 const timestamp = '2026-10-19T10:00:00Z';
 let root: string;
 let sources: Map<string, SessionSource>;
@@ -240,9 +242,48 @@ describe('harness-aware image loading', () => {
     ]);
     const session = parseClaudeSessions(projects, undefined, sources)[0].sessions[0];
     const source = { ...sources.get(session.sessionId)!, workspaceRootPath: path.join(root, 'parent-workspace') };
-    expect(session.requests[1].requestId).toBe('generated:claude:1');
-    expect(extractSourceImages(source, session.sessionId, 'generated:claude:1')).toEqual([image]);
+    expect(session.requests[1].requestId).toMatch(/^generated:claude:[a-f0-9]{32}:1$/);
+    expect(extractSourceImages(source, session.sessionId, session.requests[1].requestId)).toEqual([image]);
     expect(extractSourceImages(source, session.sessionId, 'missing')).toEqual([]);
+  });
+
+  it('uses the matched Claude user turn directory when cwd changes within a transcript', () => {
+    const projects = path.join(root, 'claude-directories');
+    const first = path.join(root, 'first-workspace');
+    const second = path.join(root, 'second-workspace');
+    fs.mkdirSync(first);
+    fs.mkdirSync(second);
+    fs.writeFileSync(path.join(first, 'screenshot.png'), Buffer.from(base64, 'base64'));
+    fs.writeFileSync(path.join(second, 'screenshot.png'), Buffer.from(alternateBase64, 'base64'));
+    const content = [{ type: 'image', source: { type: 'url', url: 'screenshot.png' } }];
+    jsonl(path.join(projects, 'project', 'session.jsonl'), [
+      { type: 'user', uuid: 'first-user', sessionId: 'directories', cwd: first, message: { role: 'user', content } },
+      { type: 'user', uuid: 'second-user', sessionId: 'directories', cwd: second, message: { role: 'user', content } },
+    ]);
+    const session = parseClaudeSessions(projects, undefined, sources)[0].sessions[0];
+    const source = sources.get(session.sessionId)!;
+    expect(source.workspaceRootPath).toBe(first);
+    expect(extractSourceImages(source, session.sessionId, 'first-user')).toEqual([image]);
+    expect(extractSourceImages(source, session.sessionId, 'second-user')).toEqual([alternateImage]);
+  });
+
+  it('keeps UUID-less parent and subagent images distinct within the same Claude session', () => {
+    const projects = path.join(root, 'claude-scoped-ids');
+    const project = path.join(projects, 'project');
+    jsonl(path.join(project, 'same-session.jsonl'), [
+      { type: 'user', sessionId: 'same-session', cwd: root, message: { role: 'user', content: [claudeImage()] } },
+    ]);
+    jsonl(path.join(project, 'same-session', 'subagents', 'agent-child.jsonl'), [
+      { type: 'user', sessionId: 'same-session', cwd: root, message: {
+        role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: alternateBase64 } }],
+      } },
+    ]);
+    const session = parseClaudeSessions(projects, undefined, sources)[0].sessions[0];
+    const source = sources.get(session.sessionId)!;
+    expect(session.requests).toHaveLength(2);
+    expect(new Set(session.requests.map(request => request.requestId)).size).toBe(2);
+    expect(extractSourceImages(source, session.sessionId, session.requests[0].requestId)).toEqual([image]);
+    expect(extractSourceImages(source, session.sessionId, session.requests[1].requestId)).toEqual([alternateImage]);
   });
 
   it('keeps targeted Codex image selection aligned with orphan replies, tools, tokens, mirrors, and aborted turns', () => {

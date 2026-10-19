@@ -84,6 +84,21 @@ describe('local image representations', () => {
     expect(loadImageReferences(imageReferencesFromVariables([{ kind: 'image', value, data }]), root)).toEqual([image]);
   });
 
+  it.each([{ data: '' }, { data: [] }, { data: 'invalid base64' }])('retains a local Xcode fileUrl when inline data cannot decode: %j', ({ data }) => {
+    const file = path.join(root, 'screenshot.png');
+    fs.writeFileSync(file, Buffer.from(bytes));
+    const references = imageReferencesFromXcode([{ fileUrl: pathToFileURL(file).href, data }]);
+    expect(loadImageReferences(references, root)).toEqual([image]);
+  });
+
+  it('preserves nested image-variable file fallbacks when both inline representations are invalid', () => {
+    const file = path.join(root, 'screenshot.png');
+    fs.writeFileSync(file, Buffer.from(bytes));
+    const value = { data: '', fileUrl: pathToFileURL(file).href };
+    const variables = [{ kind: 'image', value, data: 'invalid base64' }];
+    expect(loadImageReferences(imageReferencesFromVariables(variables), root)).toEqual([image]);
+  });
+
   it.each(['workspace', 'temp'])('loads images through a canonical local %s root', kind => {
     const home = path.join(root, 'home');
     const target = path.join(root, 'target');

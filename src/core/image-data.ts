@@ -60,9 +60,10 @@ function reference(value: Record<string, unknown>): ImageReference {
     : value.path ?? value.fsPath ?? value.fileUrl ?? value.uri ?? value.url ?? value.external ?? url ?? source.url);
   const data = source.data ?? value.data ?? value.value;
   const id = typeof value.file_id === 'string' ? value.file_id : undefined;
-  if (typeof location === 'string' && location.startsWith('data:')) return { id, data: location };
-  if (typeof data === 'string' && !data.startsWith('data:') && imagePath(data)) return { id, path: data };
-  return data === undefined ? { id, path: location } : { id, data };
+  const alternatives: ImageReference[] = location === undefined ? []
+    : [location.startsWith('data:') ? { id, data: location } : { id, path: location }];
+  if (typeof data === 'string' && !data.startsWith('data:') && imagePath(data)) return { id, path: data, alternatives };
+  return data === undefined ? alternatives[0] ?? { id } : { id, data, alternatives };
 }
 
 export function imageReferencesFromVariables(value: unknown): ImageReference[] {
@@ -70,7 +71,8 @@ export function imageReferencesFromVariables(value: unknown): ImageReference[] {
     const data = v.value;
     const fallback = isRecord(data) && ['data', 'uri', 'path', 'external', 'fsPath'].some(key => key in data)
       ? reference(data) : reference({ ...v, data: undefined });
-    return v.data === undefined ? fallback : { ...reference(v), alternatives: [fallback] };
+    const primary = reference(v);
+    return v.data === undefined ? fallback : { ...primary, alternatives: [fallback, ...primary.alternatives ?? []] };
   });
 }
 
@@ -119,7 +121,7 @@ export function imageReferencesFromCodex(payload: Record<string, unknown>): Imag
 
 function imageCandidates(image: ImageReference): ImageReference[] {
   const { alternatives, ...primary } = image;
-  return [primary, ...alternatives ?? []];
+  return [primary, ...(alternatives ?? []).flatMap(imageCandidates)];
 }
 
 function sameImage(first: ImageReference, second: ImageReference): boolean {

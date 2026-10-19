@@ -17,6 +17,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { Session, SessionRequest } from './types';
 import { assertTrustedPath, readFileSafe, createRequest, createSession, detectDevcontainerFromRequests, extractSkillNameFromPath } from './parser-shared';
 import { extractReasoningEffortFromModelId } from './helpers';
@@ -242,12 +243,22 @@ function countClaudeImages(line: ClaudeLine): number {
   return imageReferencesFromContent(line.message?.content).length;
 }
 
+function claudeTranscriptKey(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  return createHash('sha256').update(process.platform === 'win32' ? resolved.toLowerCase() : resolved).digest('hex').slice(0, 32);
+}
+
+function claudeRequestId(line: ClaudeLine, sessionId: string, requestIndex: number, transcriptKey: string): string {
+  return line.uuid || `${line.sessionId ?? sessionId}:claude:${transcriptKey}:${requestIndex}`;
+}
+
 export function extractClaudeImageReferences(
   filePath: string,
   requestId: string,
   match?: ImageRequestMatch,
 ): { images: ImageReference[]; workspaceRootPath?: string } {
   let sessionId = path.basename(filePath, '.jsonl');
+  const transcriptKey = claudeTranscriptKey(filePath);
   let firstLine = true;
   let requestIndex = 0;
   let workspaceRootPath: string | undefined;
@@ -264,10 +275,11 @@ export function extractClaudeImageReferences(
     }
     if (line.type !== 'user' || !userHasText(line)) return;
     if (!workspaceRootPath && line.cwd) workspaceRootPath = line.cwd;
-    const id = line.uuid || `${line.sessionId ?? sessionId}:claude:${requestIndex}`;
+    const id = claudeRequestId(line, sessionId, requestIndex, transcriptKey);
     requestIndex++;
     if (!found && (match?.userEventId ? line.uuid === match.userEventId : id === requestId)) {
       images = imageReferencesFromContent(line.message?.content);
+      if (line.cwd) workspaceRootPath = line.cwd;
       found = true;
     }
     const needsRoot = images.some(image => image.path && !path.isAbsolute(image.path) && !/^[a-z][a-z0-9+.-]*:/i.test(image.path));
@@ -738,8 +750,7 @@ function buildClaudeRequest(
   line: ClaudeLine,
   assistantData: ClaudeAssistantData,
   userTs: number | null,
-  requestIndex: number,
-  sessionId: string,
+  requestId: string,
   editLocIndex?: EditLocIndex,
 ): SessionRequest {
   const hasAnyTokens = assistantData.assistantCount > 0;
@@ -747,7 +758,6 @@ function buildClaudeRequest(
   const uniqueRefs = [...new Set(assistantData.referencedFiles)];
   const skills = new Set(assistantData.skillsUsed);
   for (const name of extractSkillsFromRefs(uniqueRefs)) skills.add(name);
-  const requestId = line.uuid || `${line.sessionId ?? sessionId}:claude:${requestIndex}`;
   const request = createRequest({
     requestId,
     userEventId: line.uuid,
@@ -797,6 +807,7 @@ export function parseClaudeSessionFile(
   if (lines.length === 0) return null;
 
   const sessionId = lines[0].sessionId || path.basename(filePath, '.jsonl');
+  const transcriptKey = claudeTranscriptKey(filePath);
   const requests: SessionRequest[] = [];
   let cwd = '';
   let firstTs: number | null = null;
@@ -820,7 +831,8 @@ export function parseClaudeSessionFile(
 
     const assistantData = collectClaudeAssistantData(lines, i + 1, lastTs);
     lastTs = assistantData.lastTs;
-    const request = buildClaudeRequest(line, assistantData, userTs, requests.length, sessionId, editLocIndex);
+    const requestId = claudeRequestId(line, sessionId, requests.length, transcriptKey);
+    const request = buildClaudeRequest(line, assistantData, userTs, requestId, editLocIndex);
     requests.push(request);
     i = assistantData.nextIndex;
   }
