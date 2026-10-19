@@ -29,6 +29,8 @@ import {
   recordCreatedContent,
 } from './edit-tool-diff';
 import { recordedInvestigation, recordedWebDomains } from './curiosity-activity';
+import { imageReferencesFromContent, type ImageCollector } from './image-data';
+import type { SessionSource } from './cache';
 
 interface ClaudeContentBlock {
   type: string;
@@ -206,7 +208,7 @@ function userHasText(line: ClaudeLine): boolean {
   } else {
     return false;
   }
-  if (text.length === 0) return false;
+  if (text.length === 0) return countClaudeImages(line) > 0;
   // Claude wraps slash-command input/output in <command-...> / <local-command-...> tags
   if (/^<(local-)?command-/.test(text)) return false;
   // Interrupt markers are auto-injected when the user cancels a tool call
@@ -236,8 +238,7 @@ function getClaudeUserText(line: ClaudeLine): string {
 }
 
 function countClaudeImages(line: ClaudeLine): number {
-  return toContentArray(line.message?.content)
-    .filter(block => block.type === 'image').length;
+  return imageReferencesFromContent(line.message?.content).length;
 }
 
 function applyClaudeToolBlock(
@@ -491,6 +492,7 @@ function parseClaudeProjectSessions(
   projectsDir: string,
   dirName: string,
   editLocIndex?: EditLocIndex,
+  sessionSourceIndex?: Map<string, SessionSource>,
 ): { sessions: Session[]; workspaceId: string; workspaceName: string } | null {
   const projPath = path.join(projectsDir, dirName);
   const workspaceId = `claude-${dirName}`;
@@ -508,12 +510,15 @@ function parseClaudeProjectSessions(
   // can be merged into the right parent in pass 2.
   const sessionsById = new Map<string, Session>();
   const sessions: Session[] = [];
+  const sessionFiles = new Map<string, string[]>();
   for (const entry of entries) {
     if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
-    const session = parseClaudeSessionFile(path.join(projPath, entry.name), workspaceId, workspaceName, editLocIndex);
+    const filePath = path.join(projPath, entry.name);
+    const session = parseClaudeSessionFile(filePath, workspaceId, workspaceName, editLocIndex);
     if (!session) continue;
     sessions.push(session);
     sessionsById.set(session.sessionId, session);
+    sessionFiles.set(session.sessionId, [filePath]);
   }
 
   // Pass 2: walk `<sessionId>/subagents/agent-*.jsonl` directories. Each
@@ -539,10 +544,13 @@ function parseClaudeProjectSessions(
 
     for (const subEntry of subagentEntries) {
       if (!subEntry.isFile() || !subEntry.name.endsWith('.jsonl')) continue;
-      const subSession = parseClaudeSessionFile(
-        path.join(subagentDir, subEntry.name), workspaceId, workspaceName, editLocIndex,
-      );
+      const filePath = path.join(subagentDir, subEntry.name);
+      const subSession = parseClaudeSessionFile(filePath, workspaceId, workspaceName, editLocIndex);
       if (!subSession) continue;
+      const sourceId = parent?.sessionId ?? entry.name;
+      const files = sessionFiles.get(sourceId) ?? [];
+      files.push(filePath);
+      sessionFiles.set(sourceId, files);
 
       if (parent) {
         // Merge subagent requests into parent. Sorting happens after all
@@ -598,6 +606,18 @@ function parseClaudeProjectSessions(
       session.requests.sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
     }
     session.requestCount = session.requests.length;
+    const files = sessionFiles.get(session.sessionId);
+    if (files?.length) {
+      sessionSourceIndex?.set(session.sessionId, {
+        kind: 'claude-jsonl',
+        filePath: files[0],
+        additionalFilePaths: files.slice(1),
+        workspaceId,
+        workspaceName,
+        workspaceRootPath: session.workspaceRootPath,
+        harness: session.harness,
+      });
+    }
   }
 
   return sessions.length > 0 ? { sessions, workspaceId, workspaceName } : null;
@@ -606,6 +626,7 @@ function parseClaudeProjectSessions(
 export function parseClaudeSessions(
   projectsDir: string,
   editLocIndex?: EditLocIndex,
+  sessionSourceIndex?: Map<string, SessionSource>,
 ): { sessions: Session[]; workspaceId: string; workspaceName: string }[] {
   const results: { sessions: Session[]; workspaceId: string; workspaceName: string }[] = [];
 
@@ -617,7 +638,7 @@ export function parseClaudeSessions(
   }
 
   for (const projDir of projectDirs) {
-    const result = parseClaudeProjectSessions(projectsDir, projDir.name, editLocIndex);
+    const result = parseClaudeProjectSessions(projectsDir, projDir.name, editLocIndex, sessionSourceIndex);
     if (result) results.push(result);
   }
 
@@ -628,6 +649,7 @@ export async function parseClaudeSessionsAsync(
   projectsDir: string,
   onProject?: (idx: number, total: number, name: string) => void,
   editLocIndex?: EditLocIndex,
+  sessionSourceIndex?: Map<string, SessionSource>,
 ): Promise<{ sessions: Session[]; workspaceId: string; workspaceName: string }[]> {
   const results: { sessions: Session[]; workspaceId: string; workspaceName: string }[] = [];
 
@@ -646,7 +668,7 @@ export async function parseClaudeSessionsAsync(
 
     if (onProject) onProject(i + 1, projectDirs.length, workspaceName);
 
-    const result = parseClaudeProjectSessions(projectsDir, dirName, editLocIndex);
+    const result = parseClaudeProjectSessions(projectsDir, dirName, editLocIndex, sessionSourceIndex);
     if (result) results.push(result);
 
     // Yield every 5 projects so the event loop stays responsive
@@ -720,11 +742,12 @@ function buildClaudeRequest(
   return request;
 }
 
-function parseClaudeSessionFile(
+export function parseClaudeSessionFile(
   filePath: string,
   wsId: string,
   wsName: string,
   editLocIndex?: EditLocIndex,
+  collectImages?: ImageCollector,
 ): Session | null {
   assertTrustedPath(filePath);
   let raw: string;
@@ -763,7 +786,9 @@ function parseClaudeSessionFile(
 
     const assistantData = collectClaudeAssistantData(lines, i + 1, lastTs);
     lastTs = assistantData.lastTs;
-    requests.push(buildClaudeRequest(line, assistantData, userTs, requests.length, sessionId, editLocIndex));
+    const request = buildClaudeRequest(line, assistantData, userTs, requests.length, sessionId, editLocIndex);
+    collectImages?.(request.requestId, imageReferencesFromContent(line.message?.content));
+    requests.push(request);
     i = assistantData.nextIndex;
   }
 

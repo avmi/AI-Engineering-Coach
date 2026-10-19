@@ -11,7 +11,7 @@ import { loadSessionFromDisk } from '../core/cache';
 import { FF_TOKEN_REPORTING_ENABLED } from '../core/constants';
 import { loadGitHubAppMetrics } from '../core/github-app-analytics';
 import { loadGitHubAppIssueCredits } from '../core/github-app-issue-credits';
-import { extractSessionImages } from '../core/parser-vscode-files';
+import { loadSessionImages } from '../core/session-image-loader';
 import { DateFilter, RpcMethodName, BurndownConfig } from '../core/types';
 import type { RpcMethodMap, RpcResult } from '../core/types/rpc-types';
 import {
@@ -754,13 +754,14 @@ const rpcHandlers: TypedRpcHandlers = {
   getCalendarActivity: (a, _p, params) => a.getCalendarActivity(validateDateFilter(params)),
   getProjectOverview: (a, _p, params) => a.getProjectOverview(validateDateFilter(params)),
   getImageGallery: (a, _p, params) => a.getImageGallery(validateDateFilter(params)),
-  getSessionImages: (_a, p, params) => {
+  getSessionImages: async (_a, p, params) => {
     const sessionId = isString(params?.sessionId) ? params.sessionId : '';
     const requestId = isString(params?.requestId) ? params.requestId : '';
     if (!sessionId || !requestId) return { images: [] };
     const source = p.sessionSourceIndex.get(sessionId);
-    if (!source) return { images: [] };
-    return { images: extractSessionImages(source.filePath, requestId) };
+    const session = p.sessions.find(value => value.sessionId === sessionId);
+    if (!source || !session?.requests.some(request => request.requestId === requestId)) return { images: [] };
+    return { images: await loadSessionImages(source, sessionId, requestId) };
   },
 
   /* ---- Rule Editor methods ---- */

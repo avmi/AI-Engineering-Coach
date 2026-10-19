@@ -25,6 +25,7 @@ import {
   recordCreatedContent,
 } from './edit-tool-diff';
 import { recordedTools, recordedToolFiles, recordedInvestigation, recordedWebDomains } from './curiosity-activity';
+import { imageReferencesFromAttachments, imageReferencesFromVariables, type ImageCollector, type ImageReference } from './image-data';
 
 interface CLIEvent {
   type: string;
@@ -64,6 +65,7 @@ interface TurnState {
   compaction: CompactionEvent | null;
   reasoningEffort: 'max' | 'high' | 'medium' | 'low' | null;
   imageCount: number;
+  images?: ImageReference[];
   editLocs: FileEditLocMap;
   pendingToolEdits: Map<string, PendingToolEdit>;
 }
@@ -86,6 +88,7 @@ interface CLIParseState {
   requests: SessionRequest[];
   turn: TurnState | null;
   editLocIndex?: EditLocIndex;
+  collectImages?: ImageCollector;
 }
 
 function freshTurn(userMsg: string, userTs: string | null, agentMode: string, reasoningEffort: 'max' | 'high' | 'medium' | 'low' | null): TurnState {
@@ -177,6 +180,7 @@ function flushTurn(state: CLIParseState): void {
   const responseText = turn.responseChunks.filter(Boolean).join('\n\n');
 
   const requestId = turn.lastAssistantId || `${state.sessionId}:cli:${state.requests.length}`;
+  state.collectImages?.(requestId, turn.images ?? []);
   state.requests.push(createRequest({
     requestId,
     userEventId: turn.userEventId,
@@ -215,18 +219,6 @@ function addAttachmentReferences(turn: TurnState, attachments: unknown): void {
   for (const attachment of recordArrayValue(attachments)) {
     const filePath = attachment.path;
     if (typeof filePath === 'string') turn.referencedFiles.add(filePath);
-    // Count image attachments
-    const mimeType = typeof attachment.mimeType === 'string' ? attachment.mimeType : '';
-    const type = typeof attachment.type === 'string' ? attachment.type : '';
-    if (type === 'image' || mimeType.startsWith('image/')) {
-      turn.imageCount++;
-    }
-  }
-}
-
-function countImageVariables(turn: TurnState, variables: unknown): void {
-  for (const v of recordArrayValue(variables)) {
-    if (v.kind === 'image') turn.imageCount++;
   }
 }
 
@@ -261,8 +253,12 @@ function handleUserMessage(ev: CLIEvent, state: CLIParseState): void {
     || /^[ \t]*(?:from|sender)(?:_[a-z]+)+[ \t]*[:=]/im.test(injected);
   state.turn.userEventId = ev.id;
   addAttachmentReferences(state.turn, ev.data?.attachments);
-  // Also count images from variables array (same format as VS Code sessions)
-  countImageVariables(state.turn, ev.data?.variables);
+  const images = [
+    ...imageReferencesFromAttachments(ev.data?.attachments),
+    ...imageReferencesFromVariables(ev.data?.variables),
+  ];
+  state.turn.imageCount = images.length;
+  if (state.collectImages) state.turn.images = images;
 }
 
 function handleToolExecutionStart(ev: CLIEvent, state: CLIParseState): void {
@@ -464,7 +460,7 @@ function handleCliEvent(ev: CLIEvent, state: CLIParseState, wsId: string): void 
   }
 }
 
-function createInitialCliState(wsId: string, editLocIndex?: EditLocIndex): CLIParseState {
+function createInitialCliState(wsId: string, editLocIndex?: EditLocIndex, collectImages?: ImageCollector): CLIParseState {
   return {
     sessionId: wsId,
     isApp: false,
@@ -476,6 +472,7 @@ function createInitialCliState(wsId: string, editLocIndex?: EditLocIndex): CLIPa
     requests: [],
     turn: null,
     editLocIndex,
+    collectImages,
   };
 }
 
@@ -512,8 +509,9 @@ export function parseCLIEventsFile(
   wsName: string,
   customInstructionsBytes?: number,
   editLocIndex?: EditLocIndex,
+  collectImages?: ImageCollector,
 ): Session | null {
-  const state = createInitialCliState(wsId, editLocIndex);
+  const state = createInitialCliState(wsId, editLocIndex, collectImages);
 
   let sawAnyEvent = false;
   try {

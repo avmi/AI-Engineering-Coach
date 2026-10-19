@@ -32,6 +32,8 @@ import {
   recordCreatedContent,
 } from './edit-tool-diff';
 import { recordedInvestigation, recordedWebDomains } from './curiosity-activity';
+import { imageReferencesFromContent, type ImageReference } from './image-data';
+import type { SessionSource } from './cache';
 
 interface OcSession {
   id: string;
@@ -75,6 +77,8 @@ interface OcPart {
   messageID: string;
   type: string;
   text?: string;
+  mime?: string;
+  url?: string;
   tool?: string;
   callID?: string;
   state?: { status?: string; input?: Record<string, unknown>; output?: string };
@@ -103,7 +107,7 @@ const READ_TOOLS = new Set(['read', 'glob', 'grep', 'ls', 'find']);
 
 /** The subset of `node:sqlite` this parser uses, so the module stays optional at build time. */
 interface SqliteDatabase {
-  prepare(sql: string): { all(): unknown[] };
+  prepare(sql: string): { all(...parameters: string[]): unknown[] };
   close(): void;
 }
 
@@ -366,6 +370,7 @@ function buildOpenCodeRequest(
     }
   }
   const exactLocs = hasSummaryDiffs ? summaryLocs : assistantData.editLocs;
+  const imageCount = imageReferencesFromContent(partsByMsg.get(msg.id)).length;
   mergeRequestEditLoc(editLocIndex, msg.id, exactLocs, hasSummaryDiffs);
 
   return createRequest({
@@ -374,6 +379,7 @@ function buildOpenCodeRequest(
     answerEvidence: assistantData.answerEvidence,
     timestamp: userTs,
     messageText: getOpenCodeUserText(msg, partsByMsg),
+    variableKinds: imageCount > 0 ? { image: imageCount } : {},
     responseText: assistantData.responseText,
     agentName: msg.agent || 'OpenCode',
     agentMode: msg.agent || 'build',
@@ -586,8 +592,58 @@ function parseOpenCodeDatabase(dbPath: string, editLocIndex?: EditLocIndex): Ses
   return sessions;
 }
 
-export function parseOpenCodeSessions(source: string, editLocIndex?: EditLocIndex): Session[] {
-  return source.endsWith('.db')
+export function parseOpenCodeSessions(source: string, editLocIndex?: EditLocIndex, sessionSourceIndex?: Map<string, SessionSource>): Session[] {
+  const sessions = source.endsWith('.db')
     ? parseOpenCodeDatabase(source, editLocIndex)
     : parseLegacyOpenCodeSessions(source, editLocIndex);
+  for (const session of sessions) {
+    sessionSourceIndex?.set(session.sessionId, {
+      kind: source.endsWith('.db') ? 'opencode-db' : 'opencode-storage',
+      filePath: source,
+      workspaceId: session.workspaceId,
+      workspaceName: session.workspaceName,
+      workspaceRootPath: session.workspaceRootPath,
+      harness: session.harness,
+    });
+  }
+  return sessions;
+}
+
+export function readOpenCodeImageReferences(source: string, sessionId: string, requestId: string): ImageReference[] {
+  assertTrustedPath(source);
+  if (!source.endsWith('.db')) {
+    if (![sessionId, requestId].every(id => /^[\w-]+$/.test(id))) {
+      warnCore('image-extract', 'Invalid OpenCode session or message ID');
+      return [];
+    }
+    const message = readJsonSafe<OcMessage>(path.join(source, 'message', sessionId, `${requestId}.json`));
+    if (message?.role !== 'user' || (message.sessionID !== undefined && message.sessionID !== sessionId)) return [];
+    return imageReferencesFromContent(readAllJsonInDir<OcPart>(path.join(source, 'part', requestId)));
+  }
+  const sqlite = loadSqlite();
+  if (!sqlite) return [];
+  let database: SqliteDatabase | undefined;
+  try {
+    database = new sqlite.DatabaseSync(source, { readOnly: true });
+    const rows = database.prepare(
+      'SELECT part.data FROM part JOIN message ON message.id = part.message_id AND message.session_id = part.session_id '
+      + "WHERE part.session_id = ? AND part.message_id = ? AND json_extract(message.data, '$.role') = 'user' "
+      + 'ORDER BY part.time_created, part.id',
+    ).all(sessionId, requestId);
+    const parts: unknown[] = [];
+    for (const row of rows) {
+      if (!isRecord(row) || typeof row.data !== 'string') continue;
+      try {
+        parts.push(JSON.parse(row.data));
+      } catch (error) {
+        warnCore('image-extract', 'Could not decode an OpenCode image part', error);
+      }
+    }
+    return imageReferencesFromContent(parts);
+  } catch (error) {
+    warnCore('image-extract', 'Could not read OpenCode image parts', error);
+    return [];
+  } finally {
+    database?.close();
+  }
 }
