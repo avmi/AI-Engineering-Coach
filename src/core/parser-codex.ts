@@ -19,7 +19,6 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { StringDecoder } from 'string_decoder';
 import { ModelUsage, Session, SessionRequest } from './types';
 import { assertTrustedPath, createRequest, createSession, detectDevcontainerFromRequests, extractSkillNameFromPath, extractSkillPathsFromText } from './parser-shared';
 import { canonicalizeReasoningEffort, extractReasoningEffortFromModelId, isHarnessInjectedContext } from './helpers';
@@ -33,8 +32,9 @@ import {
   recordCreatedContent,
 } from './edit-tool-diff';
 import { recordedToolFiles, recordedInvestigation, recordedWebDomains } from './curiosity-activity';
-import { imageReferencesFromCodex, mergeImageReferences, type ImageCollector, type ImageReference } from './image-data';
+import { imageReferencesFromCodex, imageRequestIndex, mergeImageReferences, type ImageCollector, type ImageReference, type ImageRequestMatch } from './image-data';
 import type { SessionSource } from './cache';
+import { forEachJsonlLine } from './parser-vscode-files';
 
 interface CodexLine {
   type: string;
@@ -54,6 +54,15 @@ interface CodexContentItem {
   text?: string;
 }
 
+interface CodexImageScan {
+  targetIndex: number;
+  currentIndex: number;
+  images: ImageReference[];
+  found: boolean;
+  hasAssistantText: boolean;
+  hasTools: boolean;
+}
+
 interface CodexParseState {
   requests: SessionRequest[];
   firstTs: number | null;
@@ -64,6 +73,7 @@ interface CodexParseState {
   hasUserResponseItem: boolean;
   hasUserMessageEvent: boolean;
   collectImages?: ImageCollector;
+  imageScan?: CodexImageScan;
   currentAssistantTexts: string[];
   currentToolsUsed: string[];
   investigationDelegations: ('research' | 'explore')[];
@@ -214,10 +224,10 @@ function updateTimestamps(state: CodexParseState, ts: number | null): void {
 }
 
 function isTurnEmpty(state: CodexParseState): boolean {
-  return state.currentAssistantTexts.length === 0
-    && state.currentToolsUsed.length === 0
-    && state.currentEditedFiles.length === 0
-    && !state.turnCanceled
+  const noActivity = state.imageScan
+    ? !state.imageScan.hasAssistantText && !state.imageScan.hasTools
+    : state.currentAssistantTexts.length === 0 && state.currentToolsUsed.length === 0 && state.currentEditedFiles.length === 0;
+  return noActivity && !state.turnCanceled
     && state.curTotalInput === state.prevTotalInput
     && state.curTotalOutput === state.prevTotalOutput;
 }
@@ -228,8 +238,21 @@ function commitCodexEdit(state: CodexParseState, pending: PendingCodexEdit): voi
 }
 
 function flushCodexTurn(state: CodexParseState, defaultModel: string): void {
-  if (!state.currentUserMessage && state.currentImageCount === 0 && state.currentAssistantTexts.length === 0) return;
+  const hasResponse = state.imageScan ? state.imageScan.hasAssistantText : state.currentAssistantTexts.length > 0;
+  if (!state.currentUserMessage && state.currentImageCount === 0 && !hasResponse) return;
   state.pendingToolEdits.clear();
+  if (state.imageScan) {
+    const scan = state.imageScan;
+    if (scan.currentIndex === scan.targetIndex) {
+      scan.images = state.currentImages;
+      scan.found = true;
+    }
+    scan.currentIndex++;
+    state.prevTotalInput = state.curTotalInput;
+    state.prevTotalOutput = state.curTotalOutput;
+    resetCodexTurn(state);
+    return;
+  }
 
   const responseText = state.currentAssistantTexts.join('\n');
   const reqPromptTokens = state.hasTokenData && state.curTotalInput > state.prevTotalInput
@@ -267,6 +290,10 @@ function flushCodexTurn(state: CodexParseState, defaultModel: string): void {
   }));
   mergeRequestEditLoc(state.editLocIndex, requestId, state.currentEditLocs);
 
+  resetCodexTurn(state);
+}
+
+function resetCodexTurn(state: CodexParseState): void {
   state.currentUserMessage = '';
   state.currentImageCount = 0;
   state.currentImages = [];
@@ -283,6 +310,10 @@ function flushCodexTurn(state: CodexParseState, defaultModel: string): void {
   state.turnCanceled = false;
   state.currentEditLocs = new Map();
   state.answerEvidence = 'missing';
+  if (state.imageScan) {
+    state.imageScan.hasAssistantText = false;
+    state.imageScan.hasTools = false;
+  }
 }
 
 function extractContentItems(value: unknown): CodexContentItem[] {
@@ -396,7 +427,7 @@ function collectCodexImages(payload: Record<string, unknown>, state: CodexParseS
   // A turn can be recorded as both event_msg and response_item. They describe
   // the same attachments, not two separate sets of screenshots.
   state.currentImageCount = Math.max(state.currentImageCount, images.length);
-  if (state.collectImages) state.currentImages = mergeImageReferences(state.currentImages, images);
+  if (state.collectImages || state.imageScan) state.currentImages = mergeImageReferences(state.currentImages, images);
 }
 
 function prepareCodexUserTurn(
@@ -595,6 +626,10 @@ function handleCodexLine(line: CodexLine, state: CodexParseState, meta: CodexSes
   state.sessionId = meta.sessionId;
   const ts = line.timestamp ? new Date(line.timestamp).getTime() : null;
   updateTimestamps(state, ts);
+  if (state.imageScan) {
+    handleCodexImageLine(line, state, meta, state.imageScan);
+    return;
+  }
 
   if (line.type === 'event_msg') {
     handleEventMsg(line.payload || {}, state, ts, meta.model);
@@ -607,39 +642,59 @@ function handleCodexLine(line: CodexLine, state: CodexParseState, meta: CodexSes
   if (line.type === 'response_item') handleResponseItem(line.payload || {}, state, ts, meta.model);
 }
 
-function readCodexJsonlStreaming(filePath: string, onLine: (line: CodexLine) => void): void {
-  const fd = fs.openSync(filePath, 'r');
-  const decoder = new StringDecoder('utf8');
-  const buffer = Buffer.allocUnsafe(1024 * 1024);
-  let remainder = '';
-
-  try {
-    while (true) {
-      const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      const text = remainder + decoder.write(buffer.subarray(0, bytesRead));
-      let start = 0;
-      let nextNewline = text.indexOf('\n', start);
-      while (nextNewline !== -1) {
-        const rawLine = text.slice(start, nextNewline);
-        if (rawLine.trim()) {
-          const parsed = parseCodexLine(rawLine);
-          if (parsed) onLine(parsed);
-        }
-        start = nextNewline + 1;
-        nextNewline = text.indexOf('\n', start);
-      }
-      remainder = text.slice(start);
+function handleCodexImageLine(line: CodexLine, state: CodexParseState, meta: CodexSessionMeta, scan: CodexImageScan): void {
+  const payload = line.payload ?? {};
+  const ts = line.timestamp ? new Date(line.timestamp).getTime() : null;
+  if (line.type === 'event_msg') {
+    const type = stringValue(payload.type);
+    if (type === 'user_message') {
+      handleUserMessageEvent(payload, state, ts, meta.model);
+      return;
     }
-
-    remainder += decoder.end();
-    if (remainder.trim()) {
-      const parsed = parseCodexLine(remainder);
-      if (parsed) onLine(parsed);
+    if (type === 'token_count') handleTokenCountEvent(payload, state);
+    if (type === 'turn_aborted') state.turnCanceled = true;
+    if (type === 'agent_reasoning' || (type === 'assistant_message' && typeof payload.content === 'string')) scan.hasAssistantText = true;
+    if (type === 'function_call') scan.hasTools = true;
+  } else if (line.type === 'response_item') {
+    if (payload.role === 'user') {
+      handleUserResponseItem(payload, state, ts, meta.model);
+      return;
     }
-  } finally {
-    fs.closeSync(fd);
+    if (payload.role === 'assistant' && payload.type === 'message') {
+      scan.hasAssistantText ||= extractContentItems(payload.content).some(item => item.type === 'output_text' && !!item.text);
+    } else if ((payload.type === 'function_call' || payload.type === 'custom_tool_call') && stringValue(payload.name)) {
+      scan.hasTools = true;
+    }
   }
+  if (scan.currentIndex === scan.targetIndex && !isTurnEmpty(state)) flushCodexTurn(state, meta.model);
+}
+
+function readCodexJsonlStreaming(filePath: string, onLine: (line: CodexLine) => void, shouldStop?: () => boolean): void {
+  forEachJsonlLine(filePath, raw => {
+    if (!raw.trim()) return;
+    const parsed = parseCodexLine(raw);
+    if (parsed) onLine(parsed);
+  }, shouldStop);
+}
+
+export function extractCodexImageReferences(filePath: string, sessionId: string, requestId: string, match?: ImageRequestMatch): ImageReference[] {
+  assertTrustedPath(filePath);
+  const index = imageRequestIndex(sessionId, requestId, 'codex', match);
+  if (index === null) return [];
+  const state = createCodexState('');
+  const scan: CodexImageScan = {
+    targetIndex: index, currentIndex: 0, images: [], found: false, hasAssistantText: false, hasTools: false,
+  };
+  state.imageScan = scan;
+  const meta: CodexSessionMeta = { sessionId, cwd: '', source: '', model: '' };
+  let wrongSession = false;
+  readCodexJsonlStreaming(filePath, line => {
+    handleCodexLine(line, state, meta);
+    wrongSession = meta.sessionId !== sessionId;
+  }, () => scan.found || wrongSession);
+  if (wrongSession) return [];
+  if (!scan.found) flushCodexTurn(state, meta.model);
+  return scan.images;
 }
 
 export function findCodexDirs(): string[] {

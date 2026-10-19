@@ -760,8 +760,12 @@ const rpcHandlers: TypedRpcHandlers = {
     if (!sessionId || !requestId) return { images: [] };
     const source = p.sessionSourceIndex.get(sessionId);
     const session = p.sessions.find(value => value.sessionId === sessionId);
-    if (!source || !session?.requests.some(request => request.requestId === requestId)) return { images: [] };
-    return { images: await loadSessionImages(source, sessionId, requestId) };
+    const index = session?.requests.findIndex(request => request.requestId === requestId) ?? -1;
+    if (!source || !session || index < 0) return { images: [] };
+    return { images: await loadSessionImages(source, sessionId, requestId, {
+      userEventId: session.requests[index].userEventId,
+      requestIndex: index,
+    }) };
   },
 
   /* ---- Rule Editor methods ---- */

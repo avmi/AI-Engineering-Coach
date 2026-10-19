@@ -39,7 +39,7 @@ export function assertTrustedPath(filePath: string, additionalRoots: readonly st
   }
 }
 
-function getTrustedRoots(): string[] {
+export function getTrustedRoots(): string[] {
   const roots: string[] = [];
   const home = process.env.HOME || process.env.USERPROFILE || '';
   if (home) roots.push(path.resolve(home));

@@ -20,10 +20,14 @@ import { extractSourceImages, loadSourceSession } from './session-images';
 import { Analyzer } from './analyzer';
 import type { SessionSource } from './cache';
 import { loadSessionFromDisk, setMemoryCache } from './cache';
-import type { ParseContext } from './parser-shared';
+import { createRequest, type ParseContext } from './parser-shared';
 import { loadSessionDetails } from './session-image-loader';
 
 vi.mock('fs', async importOriginal => ({ ...await importOriginal<typeof import('fs')>() }));
+vi.mock('./parser-shared', async importOriginal => {
+  const actual = await importOriginal<typeof import('./parser-shared')>();
+  return { ...actual, createRequest: vi.fn(actual.createRequest) };
+});
 vi.mock('./session-image-loader', () => ({
   loadSessionDetails: vi.fn((source: SessionSource, sessionId: string) => Promise.resolve(loadSourceSession(source, sessionId))),
 }));
@@ -153,6 +157,92 @@ describe('harness-aware image loading', () => {
     const session = loadSourceSession(source, 'pending');
     expect(session?.requests[0].variableKinds.image).toBe(1);
     expect(extractSourceImages(source, 'pending', 'pending:cli:0')).toEqual([image]);
+  });
+
+  it.each([false, true])('matches the cached Copilot user event after the assistant identity changes (App=%s)', app => {
+    const file = jsonl(path.join(root, 'growing-events.jsonl'), [
+      { type: 'session.start', data: { sessionId: 'growing', ...(app ? { remoteSteerable: true } : {}) } },
+      { type: 'user.message', id: 'stable-user', data: { content: 'Screenshot', variables: [{ kind: 'image', value: image }] } },
+    ]);
+    const source: SessionSource = { kind: 'cli-events', filePath: file, workspaceId: 'ws', workspaceName: 'WS', harness: 'Copilot' };
+    for (const assistantId of ['first-answer', 'later-answer']) {
+      const cached = parseCLIEventsFile(file, 'ws', 'WS')!.requests[0];
+      fs.appendFileSync(file, `\n${JSON.stringify({ type: 'assistant.message', id: assistantId, data: { content: 'Working' } })}`);
+      expect(extractSourceImages(source, 'growing', cached.requestId, { userEventId: cached.userEventId, requestIndex: 0 })).toEqual([image]);
+    }
+    expect(extractSourceImages(source, 'growing', 'growing:cli:0', { userEventId: 'missing-user', requestIndex: 0 })).toEqual([]);
+  });
+
+  it('uses an explicit cached turn index when a growing Copilot record has no native user ID', () => {
+    const file = jsonl(path.join(root, 'legacy-events.jsonl'), [
+      { type: 'session.start', data: { sessionId: 'legacy' } },
+      { type: 'user.message', data: { content: 'Text only' } },
+      { type: 'assistant.message', id: 'plain-answer', data: { content: 'Done' } },
+      { type: 'user.message', data: { content: 'Screenshot', variables: [{ kind: 'image', value: image }] } },
+    ]);
+    const source: SessionSource = { kind: 'cli-events', filePath: file, workspaceId: 'ws', workspaceName: 'WS', harness: 'Copilot' };
+    const cached = parseCLIEventsFile(file, 'ws', 'WS')!.requests[1];
+    fs.appendFileSync(file, `\n${JSON.stringify({ type: 'assistant.message', id: 'new-answer', data: { content: 'Working' } })}`);
+    expect(extractSourceImages(source, 'legacy', cached.requestId, { requestIndex: 1 })).toEqual([image]);
+  });
+
+  it.each(['cli', 'codex'])('extracts 30 %s image moments without rebuilding any normalized requests', harness => {
+    const lines: object[] = harness === 'cli'
+      ? [{ type: 'session.start', data: { sessionId: 'many-images' } }]
+      : [{ type: 'session_meta', payload: { id: 'many-images', cwd: root } }];
+    for (let index = 0; index < 30; index++) {
+      if (harness === 'cli') {
+        lines.push(
+          { type: 'user.message', id: `user-${index}`, data: { content: `Screenshot ${index}`, variables: [{ kind: 'image', value: image }] } },
+          { type: 'assistant.message', id: `answer-${index}`, data: { content: 'Done' } },
+        );
+      } else {
+        lines.push(
+          { type: 'response_item', payload: { role: 'user', content: [{ type: 'input_text', text: `Screenshot ${index}` }, { type: 'input_image', image_url: image }] } },
+          { type: 'response_item', payload: { role: 'assistant', type: 'message', content: [{ type: 'output_text', text: 'Done' }] } },
+        );
+      }
+    }
+    const file = jsonl(path.join(root, harness, 'events.jsonl'), lines);
+    const session = harness === 'cli' ? parseCLIEventsFile(file, 'ws', 'WS')!
+      : parseCodexSessions(path.dirname(file), undefined, sources)[0];
+    const source: SessionSource = harness === 'cli'
+      ? { kind: 'cli-events', filePath: file, workspaceId: 'ws', workspaceName: 'WS', harness: 'Copilot' }
+      : sources.get(session.sessionId)!;
+    expect(session.requests).toHaveLength(30);
+    vi.mocked(createRequest).mockClear();
+    for (const [index, request] of session.requests.entries()) {
+      expect(extractSourceImages(source, session.sessionId, request.requestId, { userEventId: request.userEventId, requestIndex: index }))
+        .toEqual([image]);
+    }
+    expect(createRequest).not.toHaveBeenCalled();
+  });
+
+  it('keeps targeted Codex image selection aligned with orphan replies, tools, tokens, mirrors, and aborted turns', () => {
+    jsonl(path.join(root, 'codex-parity', 'events.jsonl'), [
+      { type: 'session_meta', payload: { id: 'parity', cwd: root } },
+      { type: 'response_item', payload: { role: 'assistant', type: 'message', content: [{ type: 'output_text', text: 'Earlier reply' }] } },
+      { type: 'event_msg', payload: { type: 'user_message', message: 'First screenshot', images: [image] } },
+      { type: 'response_item', payload: { role: 'user', content: [{ type: 'input_text', text: 'First screenshot' }, { type: 'input_image', image_url: image }] } },
+      { type: 'response_item', payload: { type: 'function_call', name: 'write_file', arguments: '{"path":"test.ts","content":"new code"}', call_id: 'write' } },
+      { type: 'response_item', payload: { type: 'function_call_output', call_id: 'write', output: { success: true } } },
+      { type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10, output_tokens: 3 } } } },
+      { type: 'response_item', payload: { role: 'assistant', type: 'message', content: [{ type: 'output_text', text: 'Done' }] } },
+      { type: 'event_msg', payload: { type: 'user_message', message: '', images: [image] } },
+      { type: 'event_msg', payload: { type: 'user_message', message: '', images: [image, image] } },
+      { type: 'response_item', payload: { role: 'user', content: [{ type: 'input_image', image_url: image }, { type: 'input_image', image_url: image }] } },
+      { type: 'event_msg', payload: { type: 'turn_aborted' } },
+      { type: 'response_item', payload: { role: 'user', content: [{ type: 'input_text', text: 'Final screenshot' }, { type: 'input_image', image_url: image }] } },
+    ]);
+    const session = parseCodexSessions(path.join(root, 'codex-parity'), undefined, sources)[0];
+    const source = sources.get(session.sessionId)!;
+    expect(session.requests.map(request => request.variableKinds.image ?? 0)).toEqual([0, 1, 1, 2, 1]);
+    vi.mocked(createRequest).mockClear();
+    for (const [index, request] of session.requests.entries()) {
+      const expected = Array<string>(request.variableKinds.image ?? 0).fill(image);
+      expect(extractSourceImages(source, session.sessionId, request.requestId, { requestIndex: index })).toEqual(expected);
+    }
+    expect(createRequest).not.toHaveBeenCalled();
   });
 
   it('loads VS Code JSON and applies JSONL image patches before extraction', () => {

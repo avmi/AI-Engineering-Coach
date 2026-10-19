@@ -20,6 +20,7 @@ import {
 import { assertTrustedPath } from './parser-shared';
 
 vi.mock('fs', async importOriginal => ({ ...await importOriginal<typeof import('fs')>() }));
+vi.mock('os', async importOriginal => ({ ...await importOriginal<typeof import('os')>() }));
 
 const bytes = [137, 80, 78, 71, 13, 10, 26, 10];
 const base64 = Buffer.from(bytes).toString('base64');
@@ -33,6 +34,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -75,6 +77,37 @@ describe('local image representations', () => {
       { kind: 'image', value: { scheme: 'file', authority: '', path: decodeURIComponent(pathToFileURL(file).pathname) } },
     ];
     expect(loadImageReferences(imageReferencesFromVariables(variables), root)).toEqual([image, image]);
+  });
+
+  it.each([{ data: [] }, { data: [999] }, { data: 'invalid base64' }])('retains valid value bytes when sibling data cannot be decoded: %j', ({ data }) => {
+    const value = Object.fromEntries(bytes.map((byte, index) => [String(index), byte]));
+    expect(loadImageReferences(imageReferencesFromVariables([{ kind: 'image', value, data }]), root)).toEqual([image]);
+  });
+
+  it.each(['workspace', 'temp'])('loads images through a canonical local %s root', kind => {
+    const home = path.join(root, 'home');
+    const target = path.join(root, 'target');
+    const alias = path.join(root, 'alias');
+    fs.mkdirSync(home);
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, 'screenshot.png'), Buffer.from(bytes));
+    fs.symlinkSync(target, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_DATA_HOME']) vi.stubEnv(key, home);
+    vi.spyOn(os, 'tmpdir').mockReturnValue(kind === 'temp' ? alias : home);
+    expect(loadImageReferences([{ path: path.join(alias, 'screenshot.png') }], root, kind === 'workspace' ? alias : undefined))
+      .toEqual([image]);
+  });
+
+  it('rejects an attachment link that escapes the canonical allowed local roots', () => {
+    const home = path.join(root, 'home');
+    const workspace = path.join(root, 'workspace');
+    const outside = path.join(root, 'outside');
+    for (const directory of [home, workspace, outside]) fs.mkdirSync(directory);
+    fs.writeFileSync(path.join(outside, 'screenshot.png'), Buffer.from(bytes));
+    fs.symlinkSync(outside, path.join(workspace, 'escape'), process.platform === 'win32' ? 'junction' : 'dir');
+    for (const key of ['HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'XDG_DATA_HOME']) vi.stubEnv(key, home);
+    vi.spyOn(os, 'tmpdir').mockReturnValue(home);
+    expect(loadImageReferences([{ path: path.join(workspace, 'escape', 'screenshot.png') }], root, workspace)).toEqual([]);
   });
 
   it.each([

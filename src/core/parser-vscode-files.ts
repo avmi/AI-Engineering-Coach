@@ -43,7 +43,7 @@ const JSONL_READ_CHUNK = 1024 * 1024;
  * Searching only the new chunk keeps total work linear in the file size while producing the exact
  * same sequence of lines.
  */
-function emitChunkLines(pending: string, chunk: string, onLine: (line: string) => void): string {
+function emitChunkLines(pending: string, chunk: string, onLine: (line: string) => void, shouldStop?: () => boolean): string {
   let nl = chunk.indexOf('\n');
   if (nl < 0) {
     // No line boundary in this chunk: accumulate (V8 keeps this as a cheap cons-string, flattened
@@ -52,10 +52,12 @@ function emitChunkLines(pending: string, chunk: string, onLine: (line: string) =
   }
   // The first newline completes the line carried over from previous chunks.
   onLine(pending + chunk.slice(0, nl));
+  if (shouldStop?.()) return '';
   let start = nl + 1;
   nl = chunk.indexOf('\n', start);
   while (nl >= 0) {
     onLine(chunk.slice(start, nl));
+    if (shouldStop?.()) return '';
     start = nl + 1;
     nl = chunk.indexOf('\n', start);
   }
@@ -74,8 +76,9 @@ function emitChunkLines(pending: string, chunk: string, onLine: (line: string) =
  *
  * Lines are emitted WITHOUT their trailing '\n'. A final non-empty line with no trailing newline
  * is emitted too. Multibyte UTF-8 sequences split across chunk boundaries are handled correctly.
+ * When `shouldStop` returns true after a line, stop emitting and close the file immediately.
  */
-export function forEachJsonlLine(fpath: string, onLine: (line: string) => void): void {
+export function forEachJsonlLine(fpath: string, onLine: (line: string) => void, shouldStop?: () => boolean): void {
   assertTrustedPath(fpath);
   // Small prefetched files are already in memory — iterate them directly without a second read.
   const cached = prefetchCache.get(fpath);
@@ -85,6 +88,7 @@ export function forEachJsonlLine(fpath: string, onLine: (line: string) => void):
     let nl = cached.indexOf('\n');
     while (nl >= 0) {
       onLine(cached.slice(start, nl));
+      if (shouldStop?.()) return;
       start = nl + 1;
       nl = cached.indexOf('\n', start);
     }
@@ -99,7 +103,8 @@ export function forEachJsonlLine(fpath: string, onLine: (line: string) => void):
     let pending = '';
     let bytesRead: number;
     while ((bytesRead = fs.readSync(fd, buf, 0, JSONL_READ_CHUNK, null)) > 0) {
-      pending = emitChunkLines(pending, decoder.write(buf.subarray(0, bytesRead)), onLine);
+      pending = emitChunkLines(pending, decoder.write(buf.subarray(0, bytesRead)), onLine, shouldStop);
+      if (shouldStop?.()) return;
     }
     pending += decoder.end();
     if (pending.length > 0) onLine(pending);

@@ -137,6 +137,9 @@ describe('image worker lifecycle', () => {
         sessionId: 'session',
         requests: [{ requestId: 'answer', messageText: 'Screenshot', responseText: 'Done' }],
       });
+      fs.appendFileSync(events, `\n${JSON.stringify({ type: 'assistant.message', id: 'later-answer', data: { content: 'More work' } })}`);
+      expect(await loader.load({ ...source, filePath: events }, 'session', 'answer', { userEventId: 'user', requestIndex: 0 }))
+        .toEqual([`data:image/png;base64,${base64}`]);
       loader.dispose();
     } finally {
       fs.rmSync(directory, { recursive: true, force: true });

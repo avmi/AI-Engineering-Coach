@@ -50,7 +50,7 @@ describe('panel-rpc', () => {
     vi.mocked(loadSessionImages).mockReset().mockResolvedValue(['data:image/png;base64,image']);
     const session = createSession({
       sessionId: 'session', workspaceId: 'ws', workspaceName: 'Project', harness: 'Claude',
-      requests: [createRequest({ requestId: 'request', messageText: 'Screenshot', responseText: '' })],
+      requests: [createRequest({ requestId: 'request', userEventId: 'user-event', messageText: 'Screenshot', responseText: '' })],
     });
     const source = {
       kind: 'claude-jsonl' as const, filePath: 'session.jsonl', workspaceId: 'ws', workspaceName: 'Project', harness: 'Claude',
@@ -62,7 +62,7 @@ describe('panel-rpc', () => {
     const analyzer = new Analyzer(parsed.sessions, parsed.editLocIndex);
     expect(await handler(analyzer, parsed, { sessionId: 'session', requestId: 'request' }))
       .toEqual({ images: ['data:image/png;base64,image'] });
-    expect(loadSessionImages).toHaveBeenCalledWith(source, 'session', 'request');
+    expect(loadSessionImages).toHaveBeenCalledWith(source, 'session', 'request', { userEventId: 'user-event', requestIndex: 0 });
     expect(await handler(analyzer, parsed, { sessionId: 'session', requestId: 'unrelated' })).toEqual({ images: [] });
     expect(await handler(analyzer, parsed, { sessionId: 'missing', requestId: 'request' })).toEqual({ images: [] });
     expect(loadSessionImages).toHaveBeenCalledTimes(1);

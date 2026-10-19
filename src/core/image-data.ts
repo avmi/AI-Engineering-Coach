@@ -6,7 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { assertTrustedPath } from './parser-shared';
+import { assertTrustedPath, getTrustedRoots } from './parser-shared';
 import { warnCore } from './log';
 
 export interface ImageReference {
@@ -17,6 +17,11 @@ export interface ImageReference {
 }
 
 export type ImageCollector = (requestId: string, images: ImageReference[]) => void;
+
+export interface ImageRequestMatch {
+  userEventId?: string;
+  requestIndex?: number;
+}
 
 export const MAX_IMAGES_PER_REQUEST = 4;
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -64,13 +69,20 @@ function reference(value: Record<string, unknown>): ImageReference {
 
 export function imageReferencesFromVariables(value: unknown): ImageReference[] {
   return records(value).filter(v => v.kind === 'image').map(v => {
-    if (v.data !== undefined) return reference(v);
     const data = v.value;
-    if (isRecord(data) && ['data', 'uri', 'path', 'external', 'fsPath'].some(key => key in data)) {
-      return reference(data);
-    }
-    return reference(v);
+    const fallback = isRecord(data) && ['data', 'uri', 'path', 'external', 'fsPath'].some(key => key in data)
+      ? reference(data) : reference({ ...v, data: undefined });
+    return v.data === undefined ? fallback : { ...reference(v), alternatives: [fallback] };
   });
+}
+
+export function imageRequestIndex(sessionId: string, requestId: string, kind: 'cli' | 'codex', match?: ImageRequestMatch): number | null {
+  if (match?.requestIndex !== undefined) return Number.isSafeInteger(match.requestIndex) && match.requestIndex >= 0 ? match.requestIndex : null;
+  const prefix = `${sessionId}:${kind}:`;
+  if (!requestId.startsWith(prefix)) return null;
+  const suffix = requestId.slice(prefix.length);
+  const index = Number(suffix);
+  return /^\d+$/.test(suffix) && Number.isSafeInteger(index) ? index : null;
 }
 
 export function imageReferencesFromAttachments(value: unknown): ImageReference[] {
@@ -180,6 +192,24 @@ function imageBytes(data: unknown): Uint8Array | null {
   return bytes;
 }
 
+function assertLocalImagePath(filePath: string): void {
+  if (filePath.startsWith('\\\\') || filePath.startsWith('//')) throw new Error('Remote image files are not supported');
+}
+
+function canonicalImageRoots(filePath: string, additionalRoots: string[]): string[] {
+  const roots = new Set([...getTrustedRoots(), ...additionalRoots].map(root => path.resolve(root)));
+  const canonical: string[] = [];
+  for (const root of roots) {
+    const relative = path.relative(root, filePath);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+    assertLocalImagePath(root);
+    const resolved = fs.realpathSync(root);
+    assertLocalImagePath(resolved);
+    canonical.push(resolved);
+  }
+  return canonical;
+}
+
 function readImageFile(location: string, baseDir: string, workspaceRootPath?: string): Uint8Array {
   let filePath = location;
   if (/^file:/i.test(location)) {
@@ -189,15 +219,16 @@ function readImageFile(location: string, baseDir: string, workspaceRootPath?: st
   } else if (/^[a-z][a-z0-9+.-]*:/i.test(location) && !/^[a-z]:[\\/]/i.test(location)) {
     throw new Error('Remote image URLs are not supported');
   }
-  if (filePath.startsWith('\\\\') || filePath.startsWith('//')) throw new Error('Remote image files are not supported');
+  assertLocalImagePath(filePath);
   if (filePath.replaceAll('\\', '/').split('/').includes('..')) throw new Error('Image path traversal detected');
   filePath = path.resolve(workspaceRootPath || baseDir, filePath);
-  if (filePath.startsWith('\\\\') || filePath.startsWith('//')) throw new Error('Remote image files are not supported');
+  assertLocalImagePath(filePath);
   const roots = workspaceRootPath ? [workspaceRootPath] : [];
   assertTrustedPath(filePath, roots);
+  const canonicalRoots = canonicalImageRoots(filePath, roots);
   const resolved = fs.realpathSync(filePath);
-  if (resolved.startsWith('\\\\') || resolved.startsWith('//')) throw new Error('Remote image files are not supported');
-  assertTrustedPath(resolved, roots);
+  assertLocalImagePath(resolved);
+  assertTrustedPath(resolved, canonicalRoots);
   const fd = fs.openSync(resolved, 'r');
   try {
     const stat = fs.fstatSync(fd);

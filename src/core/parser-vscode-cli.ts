@@ -25,7 +25,7 @@ import {
   recordCreatedContent,
 } from './edit-tool-diff';
 import { recordedTools, recordedToolFiles, recordedInvestigation, recordedWebDomains } from './curiosity-activity';
-import { imageReferencesFromAttachments, imageReferencesFromVariables, type ImageCollector, type ImageReference } from './image-data';
+import { imageReferencesFromAttachments, imageReferencesFromVariables, imageRequestIndex, type ImageCollector, type ImageReference, type ImageRequestMatch } from './image-data';
 
 interface CLIEvent {
   type: string;
@@ -534,6 +534,45 @@ export function parseCLIEventsFile(
   if (!sawAnyEvent) return null;
 
   return finalizeCliSession(state, wsId, wsName, customInstructionsBytes);
+}
+
+export function extractCLIImageReferences(
+  eventsPath: string,
+  sessionId: string,
+  requestId: string,
+  match?: ImageRequestMatch,
+): ImageReference[] {
+  const userEventId = match?.userEventId;
+  const requestIndex = imageRequestIndex(sessionId, requestId, 'cli', match);
+  let currentIndex = -1;
+  let current: ImageReference[] = [];
+  let images: ImageReference[] = [];
+  let done = false;
+  forEachJsonlLine(eventsPath, line => {
+    if (!line.includes('"user.message"') && !line.includes('"session.start"')
+      && (userEventId || requestIndex !== null || !line.includes('"assistant.message"'))) return;
+    const event = parseCLIEventLine(line);
+    if (!event) return;
+    if (event.type === 'session.start' && typeof event.data?.sessionId === 'string' && event.data.sessionId !== sessionId) {
+      done = true;
+      return;
+    }
+    if (event.type === 'user.message') {
+      currentIndex++;
+      current = [
+        ...imageReferencesFromAttachments(event.data?.attachments),
+        ...imageReferencesFromVariables(event.data?.variables),
+      ];
+      if (userEventId ? event.id === userEventId : currentIndex === requestIndex) {
+        images = current;
+        done = true;
+      }
+    } else if (!userEventId && requestIndex === null && event.type === 'assistant.message' && event.id === requestId) {
+      images = current;
+      done = true;
+    }
+  }, () => done);
+  return images;
 }
 
 /**

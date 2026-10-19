@@ -78,7 +78,9 @@ let onAck: ((seq: number) => void) | null = null;
 function isSessionSourceRequest(value: object): value is SessionSourceRequest {
   const candidate = value as Partial<SessionSourceRequest>;
   const source = candidate.source;
-  return (candidate.type === 'session-detail' || (candidate.type === 'session-images' && typeof candidate.requestId === 'string'))
+  return (candidate.type === 'session-detail' || (candidate.type === 'session-images' && typeof candidate.requestId === 'string'
+    && (candidate.userEventId === undefined || typeof candidate.userEventId === 'string')
+    && (candidate.requestIndex === undefined || (Number.isSafeInteger(candidate.requestIndex) && candidate.requestIndex >= 0))))
     && typeof candidate.sessionId === 'string'
     && typeof source === 'object' && source !== null
     && typeof source.filePath === 'string' && typeof source.workspaceId === 'string'
@@ -99,7 +101,7 @@ function onMessage(handler: (msg: ParseWorkerRequest) => void | Promise<void>): 
       try {
         if (!isSessionSourceRequest(raw)) throw new Error('Invalid session source request');
         if (raw.type === 'session-images') {
-          send({ type: 'session-images', images: extractSourceImages(raw.source, raw.sessionId, raw.requestId) });
+          send({ type: 'session-images', images: extractSourceImages(raw.source, raw.sessionId, raw.requestId, raw) });
         } else {
           send({ type: 'session-detail', session: loadSourceSession(raw.source, raw.sessionId) });
         }

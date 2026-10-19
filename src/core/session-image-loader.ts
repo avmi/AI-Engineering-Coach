@@ -10,6 +10,7 @@ import type { Session } from './types';
 import type { SessionSourceRequest } from './session-images';
 import { SessionSchema } from './schemas';
 import { warnCore } from './log';
+import type { ImageRequestMatch } from './image-data';
 
 interface ImageWorker {
   on(event: 'message', listener: (value: unknown) => void): void;
@@ -33,8 +34,8 @@ export class SessionImageLoader {
     resourceLimits: { maxOldGenerationSizeMb: 1024 },
   })) {}
 
-  load(source: SessionSource, sessionId: string, requestId: string): Promise<string[]> {
-    return this.enqueue({ type: 'session-images', source, sessionId, requestId }, value => {
+  load(source: SessionSource, sessionId: string, requestId: string, match?: ImageRequestMatch): Promise<string[]> {
+    return this.enqueue({ type: 'session-images', source, sessionId, requestId, ...match }, value => {
       if (!('images' in value) || !Array.isArray(value.images)
         || !value.images.every((image: unknown) => typeof image === 'string')) {
         throw new Error('Invalid image worker response');
@@ -134,8 +135,8 @@ export class SessionImageLoader {
 
 const imageLoader = new SessionImageLoader();
 
-export function loadSessionImages(source: SessionSource, sessionId: string, requestId: string): Promise<string[]> {
-  return imageLoader.load(source, sessionId, requestId);
+export function loadSessionImages(source: SessionSource, sessionId: string, requestId: string, match?: ImageRequestMatch): Promise<string[]> {
+  return imageLoader.load(source, sessionId, requestId, match);
 }
 
 export function loadSessionDetails(source: SessionSource, sessionId: string): Promise<Session | null> {

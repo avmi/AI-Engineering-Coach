@@ -6,16 +6,16 @@
 import * as path from 'path';
 import type { SessionSource } from './cache';
 import type { Session } from './types';
-import { parseCLIEventsFile } from './parser-vscode-cli';
+import { extractCLIImageReferences, parseCLIEventsFile } from './parser-vscode-cli';
 import { parseClaudeSessionFile } from './parser-claude';
-import { parseCodexSessionFile } from './parser-codex';
+import { extractCodexImageReferences, parseCodexSessionFile } from './parser-codex';
 import { loadOpenCodeSession, readOpenCodeImageReferences } from './parser-opencode';
 import { loadXcodeSession, readXcodeImageReferences } from './parser-xcode';
 import { parseSessionFile } from './parser-vscode';
 import { extractSessionImages } from './parser-vscode-files';
-import { loadImageReferences, type ImageCollector, type ImageReference } from './image-data';
+import { loadImageReferences, type ImageCollector, type ImageReference, type ImageRequestMatch } from './image-data';
 
-export interface SessionImagesRequest {
+export interface SessionImagesRequest extends ImageRequestMatch {
   type: 'session-images';
   source: SessionSource;
   sessionId: string;
@@ -64,9 +64,8 @@ export function loadSourceSession(source: SessionSource, sessionId: string): Ses
 }
 
 /** Runs in the parse worker; raw payloads never enter the analytics cache. */
-export function extractSourceImages(source: SessionSource, sessionId: string, requestId: string): string[] {
+export function extractSourceImages(source: SessionSource, sessionId: string, requestId: string, match?: ImageRequestMatch): string[] {
   let references: ImageReference[] = [];
-  let session: Session | null = null;
   const collect: ImageCollector = (id, images) => {
     if (id === requestId) references = images;
   };
@@ -74,14 +73,14 @@ export function extractSourceImages(source: SessionSource, sessionId: string, re
     case 'vscode-session-file':
       return extractSessionImages(source.filePath, requestId, source.workspaceRootPath);
     case 'cli-events':
-      session = parseCLIEventsFile(source.filePath, source.workspaceId, source.workspaceName, undefined, undefined, collect);
+      references = extractCLIImageReferences(source.filePath, sessionId, requestId, match);
       break;
     case 'codex-jsonl':
-      session = parseCodexSessionFile(source.filePath, undefined, collect);
+      references = extractCodexImageReferences(source.filePath, sessionId, requestId, match);
       break;
     case 'claude-jsonl':
       for (const file of [source.filePath, ...source.additionalFilePaths ?? []]) {
-        session = parseClaudeSessionFile(file, source.workspaceId, source.workspaceName, undefined, collect);
+        const session = parseClaudeSessionFile(file, source.workspaceId, source.workspaceName, undefined, collect);
         if (references.length > 0) return loadImageReferences(references, path.dirname(file), session?.workspaceRootPath);
       }
       return [];
@@ -93,5 +92,5 @@ export function extractSourceImages(source: SessionSource, sessionId: string, re
       references = readXcodeImageReferences(source.filePath, sessionId, requestId);
       break;
   }
-  return loadImageReferences(references, path.dirname(source.filePath), session?.workspaceRootPath ?? source.workspaceRootPath);
+  return loadImageReferences(references, path.dirname(source.filePath), source.workspaceRootPath);
 }
