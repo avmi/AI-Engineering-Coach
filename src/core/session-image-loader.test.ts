@@ -11,14 +11,14 @@ import { Worker } from 'worker_threads';
 import { build } from 'esbuild';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { SessionImageLoader } from './session-image-loader';
-import type { SessionImagesRequest } from './session-images';
+import type { SessionSourceRequest } from './session-images';
 import type { SessionSource } from './cache';
 
 class FakeWorker extends EventEmitter {
-  requests: SessionImagesRequest[] = [];
+  requests: SessionSourceRequest[] = [];
   terminate = vi.fn(() => Promise.resolve(0));
   unref(): void {}
-  postMessage(request: SessionImagesRequest): void {
+  postMessage(request: SessionSourceRequest): void {
     this.requests.push(request);
   }
 }
@@ -43,11 +43,11 @@ describe('image worker lifecycle', () => {
     const first = loader.load(source, 'session', 'first');
     const second = loader.load(source, 'session', 'second');
     await Promise.resolve();
-    expect(worker.requests.map(request => request.requestId)).toEqual(['first']);
+    expect(worker.requests).toMatchObject([{ type: 'session-images', requestId: 'first' }]);
     worker.emit('message', { type: 'session-images', images: ['data:image/png;base64,first'] });
     expect(await first).toEqual(['data:image/png;base64,first']);
     await Promise.resolve();
-    expect(worker.requests.map(request => request.requestId)).toEqual(['first', 'second']);
+    expect(worker.requests).toMatchObject([{ requestId: 'first' }, { requestId: 'second' }]);
     worker.emit('message', { type: 'session-images', images: [] });
     expect(await second).toEqual([]);
     expect(create).toHaveBeenCalledTimes(1);
@@ -93,7 +93,24 @@ describe('image worker lifecycle', () => {
     expect(worker.terminate).toHaveBeenCalledTimes(2);
   });
 
-  it('extracts images through the real bundled parse-worker protocol', async () => {
+  it('queues session details off-thread and validates detail replies', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const worker = new FakeWorker();
+    const loader = new SessionImageLoader(() => worker);
+    loaders.push(loader);
+    const detail = loader.loadSession(source, 'session');
+    await Promise.resolve();
+    expect(worker.requests).toEqual([{ type: 'session-detail', source, sessionId: 'session' }]);
+    worker.emit('message', { type: 'session-detail', session: null });
+    expect(await detail).toBeNull();
+    const invalid = loader.loadSession(source, 'session');
+    const rejected = expect(invalid).rejects.toThrow();
+    await Promise.resolve();
+    worker.emit('message', { type: 'session-detail', session: { sessionId: 'session' } });
+    await rejected;
+  });
+
+  it('extracts images and session details through the real bundled parse-worker protocol', async () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'coach-image-worker-'));
     try {
       const workerPath = path.join(directory, 'parse-worker.cjs');
@@ -112,6 +129,10 @@ describe('image worker lifecycle', () => {
       loaders.push(loader);
       expect(await loader.load({ ...source, filePath: events }, 'session', 'answer')).toEqual([`data:image/png;base64,${base64}`]);
       expect(await loader.load({ ...source, filePath: events }, 'session', 'unknown')).toEqual([]);
+      expect(await loader.loadSession({ ...source, filePath: events }, 'session')).toMatchObject({
+        sessionId: 'session',
+        requests: [{ requestId: 'answer', messageText: 'Screenshot', responseText: 'Done' }],
+      });
       loader.dispose();
     } finally {
       fs.rmSync(directory, { recursive: true, force: true });

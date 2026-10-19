@@ -14,9 +14,12 @@ import {
   imageReferencesFromVariables,
   imageReferencesFromXcode,
   loadImageReferences,
+  mergeImageReferences,
   MAX_IMAGE_BYTES,
 } from './image-data';
 import { assertTrustedPath } from './parser-shared';
+
+vi.mock('fs', async importOriginal => ({ ...await importOriginal<typeof import('fs')>() }));
 
 const bytes = [137, 80, 78, 71, 13, 10, 26, 10];
 const base64 = Buffer.from(bytes).toString('base64');
@@ -62,6 +65,56 @@ describe('local image representations', () => {
       ...imageReferencesFromXcode([{ data: base64, fileUrl: 'file:///deleted-image.png' }]),
     ];
     expect(loadImageReferences(references, root)).toEqual([image, image, image, image]);
+  });
+
+  it('loads fsPath variables and serialized file URI objects', () => {
+    const file = path.join(root, 'screen # 100%.png');
+    fs.writeFileSync(file, Buffer.from(bytes));
+    const variables = [
+      { kind: 'image', value: { fsPath: file } },
+      { kind: 'image', value: { scheme: 'file', authority: '', path: decodeURIComponent(pathToFileURL(file).pathname) } },
+    ];
+    expect(loadImageReferences(imageReferencesFromVariables(variables), root)).toEqual([image, image]);
+  });
+
+  it.each([
+    { scheme: 'file', path: '/deleted/screenshot.png' },
+    { scheme: 'vscode-chat-code-block', path: '/screenshot.png' },
+  ])('preserves embedded bytes alongside image variable URI metadata: %j', value => {
+    const variables = [{ kind: 'image', value, data: bytes }];
+    expect(loadImageReferences(imageReferencesFromVariables(variables), root)).toEqual([image]);
+  });
+
+  it('matches mirrored image identities before assigning fallback slots', () => {
+    const second = Buffer.from([...bytes, 1]).toString('base64');
+    const previous = [{ id: 'first', data: base64 }, { id: 'second', data: second }];
+    const incoming = [{ id: 'second' }, { id: 'first' }];
+    expect(loadImageReferences(mergeImageReferences(previous, incoming), root))
+      .toEqual([image, `data:image/png;base64,${second}`]);
+  });
+
+  it('retains local-file fallbacks when a mirrored inline payload is invalid', () => {
+    const file = path.join(root, 'screenshot.png');
+    fs.writeFileSync(file, Buffer.from(bytes));
+    const images = mergeImageReferences([{ path: file }], [{ data: 'invalid base64 payload' }]);
+    expect(loadImageReferences(images, root)).toEqual([image]);
+  });
+
+  it.skipIf(process.platform !== 'win32')('rejects relative images under a network workspace before filesystem access', () => {
+    const realpath = vi.spyOn(fs, 'realpathSync').mockImplementation(() => {
+      throw new Error('Unexpected filesystem access');
+    });
+    expect(loadImageReferences([{ path: 'screenshot.png' }], root, '\\\\server\\share\\project')).toEqual([]);
+    expect(realpath).not.toHaveBeenCalled();
+  });
+
+  it.skipIf(process.platform !== 'win32')('rejects image paths that canonicalize to network shares before opening files', () => {
+    vi.spyOn(fs, 'realpathSync').mockReturnValue('\\\\server\\share\\screenshot.png');
+    const open = vi.spyOn(fs, 'openSync').mockImplementation(() => {
+      throw new Error('Unexpected filesystem access');
+    });
+    expect(loadImageReferences([{ path: path.join(root, 'screenshot.png') }], root)).toEqual([]);
+    expect(open).not.toHaveBeenCalled();
   });
 
   it('does not classify ordinary file or tool-result content as user images', () => {

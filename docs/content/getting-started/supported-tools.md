@@ -59,6 +59,8 @@ Coding Moments counts image attachments on user turns and loads the original ima
 
 Image extraction runs in the existing parse worker, not on the extension-host thread. Raw image payloads are not stored in the analytics cache. Extraction returns at most four images per turn, with a 10 MB limit per image. Local PNG, JPEG, GIF, WebP, BMP, and AVIF images are supported. Reconstructing raw VS Code JSON or JSONL state is limited to 50 MB per session file.
 
+Full session details are also reloaded in the parse worker. OpenCode detail reloads read only the selected session's metadata, messages, and parts rather than parsing every stored session.
+
 An attachment can still be counted when its original file has been deleted, its payload was not retained, or it exceeds the size limit. Such attachments cannot be displayed. Remote image URLs and network shares are never fetched, and SVG content is not rendered. Session logs and attachment files are never modified.
 
 ## Workspace Filtering

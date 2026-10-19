@@ -21,6 +21,12 @@ import { Analyzer } from './analyzer';
 import type { SessionSource } from './cache';
 import { loadSessionFromDisk, setMemoryCache } from './cache';
 import type { ParseContext } from './parser-shared';
+import { loadSessionDetails } from './session-image-loader';
+
+vi.mock('fs', async importOriginal => ({ ...await importOriginal<typeof import('fs')>() }));
+vi.mock('./session-image-loader', () => ({
+  loadSessionDetails: vi.fn((source: SessionSource, sessionId: string) => Promise.resolve(loadSourceSession(source, sessionId))),
+}));
 
 const base64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScLbtAAAAABJRU5ErkJggg==';
 const image = `data:image/png;base64,${base64}`;
@@ -88,6 +94,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   fs.rmSync(root, { recursive: true, force: true });
 });
@@ -207,6 +214,36 @@ describe('harness-aware image loading', () => {
     expect(extractSourceImages(source, session.sessionId, session.requests[1].requestId)).toEqual([image, image]);
   });
 
+  it('does not merge consecutive Codex image-only event records before any assistant activity', () => {
+    jsonl(path.join(root, 'codex', 'rollout.jsonl'), [
+      { type: 'session_meta', payload: { id: 'image-events', cwd: root } },
+      { type: 'event_msg', timestamp, payload: { type: 'user_message', message: '', images: [image] } },
+      { type: 'event_msg', timestamp, payload: { type: 'user_message', message: '', images: [image, image] } },
+    ]);
+    const session = parseCodexSessions(path.join(root, 'codex'), undefined, sources)[0];
+    expect(session.requests.map(request => request.variableKinds.image)).toEqual([1, 2]);
+    const source = sources.get(session.sessionId)!;
+    expect(extractSourceImages(source, session.sessionId, session.requests[0].requestId)).toEqual([image]);
+    expect(extractSourceImages(source, session.sessionId, session.requests[1].requestId)).toEqual([image, image]);
+  });
+
+  it.each([false, true])('retains inline Codex payloads when a mirrored record has more unavailable references (response first=%s)', responseFirst => {
+    const event = { type: 'event_msg', timestamp, payload: {
+      type: 'user_message', message: 'Screenshot', file_ids: ['unavailable-file'], local_images: ['deleted.png'],
+    } };
+    const response = { type: 'response_item', timestamp, payload: {
+      role: 'user', content: [{ type: 'input_text', text: 'Screenshot' }, { type: 'input_image', image_url: image }],
+    } };
+    jsonl(path.join(root, 'codex', 'rollout.jsonl'), [
+      { type: 'session_meta', payload: { id: 'mirror-payloads', cwd: root } },
+      ...(responseFirst ? [response, event] : [event, response]),
+    ]);
+    const session = parseCodexSessions(path.join(root, 'codex'), undefined, sources)[0];
+    expect(session.requests).toHaveLength(1);
+    expect(session.requests[0].variableKinds.image).toBe(2);
+    expect(extractSourceImages(sources.get(session.sessionId)!, session.sessionId, session.requests[0].requestId)).toEqual([image]);
+  });
+
   it('counts Codex local files and unavailable file IDs without treating remote IDs as paths', () => {
     const file = path.join(root, 'screen.png');
     fs.writeFileSync(file, Buffer.from(base64, 'base64'));
@@ -226,7 +263,12 @@ describe('harness-aware image loading', () => {
     const source = sources.get(session.sessionId)!;
     expect(extractSourceImages(source, session.sessionId, 'oc-user')).toEqual([image]);
     expect(extractSourceImages(source, session.sessionId, 'unknown')).toEqual([]);
+    const readdir = vi.spyOn(fs, 'readdirSync');
     expect(loadSourceSession(source, session.sessionId)?.requests[0].variableKinds.image).toBe(1);
+    expect(readdir.mock.calls.map(([directory]) => String(directory))).toEqual([
+      path.join(storage, 'message', 'oc-session'),
+      path.join(storage, 'part', 'oc-user'),
+    ]);
   });
 
   it('counts and loads OpenCode SQLite image parts using both session and user-message IDs', () => {
@@ -253,7 +295,10 @@ describe('harness-aware image loading', () => {
     expect(extractSourceImages(source, 'oc-db', 'assistant')).toEqual([]);
     expect(extractSourceImages(source, 'wrong-session', 'user')).toEqual([]);
     expect(extractSourceImages(source, 'oc-db', "' OR 1=1 --")).toEqual([]);
+    const prepare = vi.spyOn(DatabaseSync.prototype, 'prepare');
     expect(loadSourceSession(source, 'oc-db')?.requests[0].variableKinds.image).toBe(1);
+    expect(prepare.mock.calls.map(([sql]) => sql)).toHaveLength(3);
+    expect(prepare.mock.calls.every(([sql]) => / WHERE (?:id|session_id) = \?/.test(sql))).toBe(true);
   });
 
   it('registers loadable external sources during cold parsing and asynchronous refresh', async () => {
@@ -264,9 +309,11 @@ describe('harness-aware image loading', () => {
     setMemoryCache(result, {});
     const gallery = new Analyzer(result.sessions, result.editLocIndex).getImageGallery();
     expect(gallery.moments).toHaveLength(4);
+    vi.mocked(loadSessionDetails).mockClear();
     for (const moment of gallery.moments) {
       expect(extractSourceImages(result.sessionSourceIndex.get(moment.sessionId)!, moment.sessionId, moment.id)).toEqual([image]);
       expect((await loadSessionFromDisk(moment.sessionId))?.requests.some(request => request.requestId === moment.id)).toBe(true);
+      expect(loadSessionDetails).toHaveBeenCalledWith(result.sessionSourceIndex.get(moment.sessionId), moment.sessionId);
     }
     sources.set('deleted-session', { kind: 'claude-jsonl', filePath: 'deleted.jsonl', workspaceId: 'ws', workspaceName: 'WS', harness: 'Claude' });
     await collectExternalHarnessesAsync(new Map(), [], new Map(), {}, sources);

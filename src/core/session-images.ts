@@ -9,7 +9,7 @@ import type { Session } from './types';
 import { parseCLIEventsFile } from './parser-vscode-cli';
 import { parseClaudeSessionFile } from './parser-claude';
 import { parseCodexSessionFile } from './parser-codex';
-import { parseOpenCodeSessions, readOpenCodeImageReferences } from './parser-opencode';
+import { loadOpenCodeSession, readOpenCodeImageReferences } from './parser-opencode';
 import { loadXcodeSession, readXcodeImageReferences } from './parser-xcode';
 import { parseSessionFile } from './parser-vscode';
 import { extractSessionImages } from './parser-vscode-files';
@@ -21,6 +21,14 @@ export interface SessionImagesRequest {
   sessionId: string;
   requestId: string;
 }
+
+export interface SessionDetailRequest {
+  type: 'session-detail';
+  source: SessionSource;
+  sessionId: string;
+}
+
+export type SessionSourceRequest = SessionImagesRequest | SessionDetailRequest;
 
 export function loadSourceSession(source: SessionSource, sessionId: string): Session | null {
   switch (source.kind) {
@@ -49,7 +57,7 @@ export function loadSourceSession(source: SessionSource, sessionId: string): Ses
     }
     case 'opencode-storage':
     case 'opencode-db':
-      return parseOpenCodeSessions(source.filePath).find(session => session.sessionId === sessionId) ?? null;
+      return loadOpenCodeSession(source.filePath, sessionId);
     case 'xcode-db':
       return loadXcodeSession(source.filePath, sessionId);
   }

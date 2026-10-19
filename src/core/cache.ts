@@ -16,7 +16,7 @@ import * as path from 'path';
 import { Session, Workspace } from './types';
 import { EditLoc, EditLocIndex } from './edit-loc-diff';
 import { warnCore } from './log';
-import { loadSourceSession } from './session-images';
+import { loadSessionDetails } from './session-image-loader';
 import { stripSingleSession } from './parser-shared';
 
 export interface ParseResult {
@@ -460,7 +460,7 @@ export async function loadSessionFromDisk(sessionId: string): Promise<Session | 
     }
     if (!source) return null;
 
-    return loadSourceSession(source, sessionId);
+    return await loadSessionDetails(source, sessionId);
   } catch (error) {
     warnCore('cache', `Could not reload session ${sessionId}`, error);
     return null;

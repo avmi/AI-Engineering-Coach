@@ -6,7 +6,9 @@
 import * as path from 'path';
 import { Worker } from 'worker_threads';
 import type { SessionSource } from './cache';
-import type { SessionImagesRequest } from './session-images';
+import type { Session } from './types';
+import type { SessionSourceRequest } from './session-images';
+import { SessionSchema } from './schemas';
 import { warnCore } from './log';
 
 interface ImageWorker {
@@ -16,7 +18,7 @@ interface ImageWorker {
   off(event: 'message', listener: (value: unknown) => void): void;
   off(event: 'error', listener: (error: Error) => void): void;
   off(event: 'exit', listener: (code: number) => void): void;
-  postMessage(request: SessionImagesRequest): void;
+  postMessage(request: SessionSourceRequest): void;
   terminate(): Promise<number>;
   unref(): void;
 }
@@ -32,7 +34,24 @@ export class SessionImageLoader {
   })) {}
 
   load(source: SessionSource, sessionId: string, requestId: string): Promise<string[]> {
-    const result = this.queue.then(() => this.run({ type: 'session-images', source, sessionId, requestId }));
+    return this.enqueue({ type: 'session-images', source, sessionId, requestId }, value => {
+      if (!('images' in value) || !Array.isArray(value.images)
+        || !value.images.every((image: unknown) => typeof image === 'string')) {
+        throw new Error('Invalid image worker response');
+      }
+      return value.images;
+    });
+  }
+
+  loadSession(source: SessionSource, sessionId: string): Promise<Session | null> {
+    return this.enqueue({ type: 'session-detail', source, sessionId }, value => {
+      if (!('session' in value)) throw new Error('Invalid session worker response');
+      return value.session === null ? null : SessionSchema.parse(value.session);
+    });
+  }
+
+  private enqueue<T>(request: SessionSourceRequest, decode: (value: object) => T): Promise<T> {
+    const result = this.queue.then(() => this.run(request, decode));
     // A failed request must not prevent subsequent image requests from running.
     this.queue = result.then(() => undefined, () => undefined);
     return result;
@@ -45,7 +64,7 @@ export class SessionImageLoader {
     if (worker) void worker.terminate();
   }
 
-  private run(request: SessionImagesRequest): Promise<string[]> {
+  private run<T>(request: SessionSourceRequest, decode: (value: object) => T): Promise<T> {
     clearTimeout(this.idleTimer);
     if (!this.worker) {
       const created = this.createWorker();
@@ -84,15 +103,21 @@ export class SessionImageLoader {
           fail(new Error('message' in value && typeof value.message === 'string' ? value.message : 'Image extraction failed'));
           return;
         }
-        if (value.type !== 'session-images' || !('images' in value) || !Array.isArray(value.images)
-          || !value.images.every((image: unknown) => typeof image === 'string')) {
-          fail(new Error('Invalid image worker response'));
+        if (value.type !== request.type) {
+          fail(new Error('Invalid session worker response'));
+          return;
+        }
+        let result: T;
+        try {
+          result = decode(value);
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error(String(error)));
           return;
         }
         cleanup();
         this.idleTimer = setTimeout(() => this.dispose(), 10_000);
         this.idleTimer.unref?.();
-        resolve(value.images);
+        resolve(result);
       };
       const timer = setTimeout(() => fail(new Error('Image extraction timed out')), 120_000);
       worker.on('message', onMessage);
@@ -111,4 +136,8 @@ const imageLoader = new SessionImageLoader();
 
 export function loadSessionImages(source: SessionSource, sessionId: string, requestId: string): Promise<string[]> {
   return imageLoader.load(source, sessionId, requestId);
+}
+
+export function loadSessionDetails(source: SessionSource, sessionId: string): Promise<Session | null> {
+  return imageLoader.loadSession(source, sessionId);
 }

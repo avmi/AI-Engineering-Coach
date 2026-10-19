@@ -450,10 +450,12 @@ function buildOpenCodeSession(
   });
 }
 
-function parseLegacyOpenCodeSessions(storageDir: string, editLocIndex?: EditLocIndex): Session[] {
+function parseLegacyOpenCodeSessions(storageDir: string, editLocIndex?: EditLocIndex, sessionId?: string): Session[] {
   const sessions: Session[] = [];
   const sessionDir = path.join(storageDir, 'session', 'global');
-  const rawSessions = readAllJsonInDir<OcSession>(sessionDir);
+  const selected = sessionId === undefined ? null : readJsonSafe<OcSession>(path.join(sessionDir, `${sessionId}.json`));
+  const rawSessions = sessionId === undefined ? readAllJsonInDir<OcSession>(sessionDir)
+    : selected?.id === sessionId ? [selected] : [];
 
   for (const rawSession of rawSessions) {
     const rawMessages = readAllJsonInDir<OcMessage>(path.join(storageDir, 'message', rawSession.id));
@@ -465,10 +467,11 @@ function parseLegacyOpenCodeSessions(storageDir: string, editLocIndex?: EditLocI
   return sessions;
 }
 
-function queryOpenCodeDatabase<T>(database: SqliteDatabase, sql: string): T[] {
+function queryOpenCodeDatabase<T>(database: SqliteDatabase, sql: string, ...parameters: string[]): T[] {
   try {
-    return database.prepare(sql).all() as T[];
-  } catch {
+    return database.prepare(sql).all(...parameters) as T[];
+  } catch (error) {
+    warnCore('parser-opencode', 'Could not query OpenCode database', error);
     return [];
   }
 }
@@ -528,27 +531,31 @@ function decodeOpenCodePart(row: OcDbDataRow): OcPart | null {
   }
 }
 
-function parseOpenCodeDatabase(dbPath: string, editLocIndex?: EditLocIndex): Session[] {
+function parseOpenCodeDatabase(dbPath: string, editLocIndex?: EditLocIndex, sessionId?: string): Session[] {
   assertTrustedPath(dbPath);
   const sqlite = loadSqlite();
   if (!sqlite) return [];
   let database: SqliteDatabase;
   try {
     database = new sqlite.DatabaseSync(dbPath, { readOnly: true });
-  } catch {
+  } catch (error) {
+    warnCore('parser-opencode', 'Could not open OpenCode database', error);
     return [];
   }
 
+  const parameters = sessionId === undefined ? [] : [sessionId];
+  const sessionFilter = sessionId === undefined ? '' : ' WHERE id = ?';
+  const dataFilter = sessionId === undefined ? '' : ' WHERE session_id = ?';
   const rawSessions = queryOpenCodeDatabase<OcDbSessionRow>(database,
     'SELECT id, project_id AS projectID, directory, title, slug, '
-      + 'time_created AS created, time_updated AS updated FROM session ORDER BY time_created');
+      + `time_created AS created, time_updated AS updated FROM session${sessionFilter} ORDER BY time_created`, ...parameters);
   const messageRows = queryOpenCodeDatabase<OcDbDataRow>(database,
     'SELECT id, session_id AS sessionID, time_created AS created, '
-      + 'time_updated AS completed, data FROM message ORDER BY session_id, time_created, id');
+      + `time_updated AS completed, data FROM message${dataFilter} ORDER BY session_id, time_created, id`, ...parameters);
   const partRows = queryOpenCodeDatabase<OcDbDataRow>(database,
     'SELECT id, session_id AS sessionID, message_id AS messageID, '
-      + 'time_created AS created, time_updated AS completed, data FROM part '
-      + 'ORDER BY session_id, time_created, id');
+      + `time_created AS created, time_updated AS completed, data FROM part${dataFilter} `
+      + 'ORDER BY session_id, time_created, id', ...parameters);
   database.close();
   const messagesBySession = new Map<string, OcMessage[]>();
   for (const message of messageRows.map(decodeOpenCodeMessage)) {
@@ -590,6 +597,17 @@ function parseOpenCodeDatabase(dbPath: string, editLocIndex?: EditLocIndex): Ses
     if (session) sessions.push(session);
   }
   return sessions;
+}
+
+export function loadOpenCodeSession(source: string, sessionId: string): Session | null {
+  if (!/^[\w-]+$/.test(sessionId)) {
+    warnCore('parser-opencode', 'Invalid OpenCode session ID');
+    return null;
+  }
+  const sessions = source.endsWith('.db')
+    ? parseOpenCodeDatabase(source, undefined, sessionId)
+    : parseLegacyOpenCodeSessions(source, undefined, sessionId);
+  return sessions[0] ?? null;
 }
 
 export function parseOpenCodeSessions(source: string, editLocIndex?: EditLocIndex, sessionSourceIndex?: Map<string, SessionSource>): Session[] {

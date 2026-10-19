@@ -493,7 +493,7 @@ function finalizeCliSession(
     workspaceName: wsName,
     location: 'cli',
     harness: harnessName(state),
-    creationDate: creationDate ?? undefined,
+    ...(creationDate === null ? {} : { creationDate }),
     requests: state.requests,
     modelUsage: state.modelUsage,
     endReason: state.sawShutdown ? 'shutdown' : 'active',

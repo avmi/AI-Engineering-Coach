@@ -17,7 +17,7 @@ import { getParseWarningCounts, getParseWarnings, setCuriosityDetector } from '.
 import { detectCuriosity } from './curiosity';
 import { installRuntimeDebugHooks, runtimeDebug } from './runtime-debug';
 import { createTelemetrySampler } from './worker-telemetry';
-import { extractSourceImages, type SessionImagesRequest } from './session-images';
+import { extractSourceImages, loadSourceSession, type SessionSourceRequest } from './session-images';
 
 interface ParseWorkerRequest {
   logsDirs?: string[];
@@ -75,12 +75,12 @@ function isAckMessage(msg: unknown): msg is AckMessage {
 /** Set by the streaming step to receive chunk acks from the parent. */
 let onAck: ((seq: number) => void) | null = null;
 
-function isSessionImagesRequest(value: unknown): value is SessionImagesRequest {
+function isSessionSourceRequest(value: unknown): value is SessionSourceRequest {
   if (typeof value !== 'object' || value === null) return false;
-  const candidate = value as Partial<SessionImagesRequest>;
+  const candidate = value as Partial<SessionSourceRequest>;
   const source = candidate.source;
-  return candidate.type === 'session-images'
-    && typeof candidate.sessionId === 'string' && typeof candidate.requestId === 'string'
+  return (candidate.type === 'session-detail' || (candidate.type === 'session-images' && typeof candidate.requestId === 'string'))
+    && typeof candidate.sessionId === 'string'
     && typeof source === 'object' && source !== null
     && typeof source.filePath === 'string' && typeof source.workspaceId === 'string'
     && typeof source.workspaceName === 'string' && typeof source.harness === 'string'
@@ -96,10 +96,14 @@ function onMessage(handler: (msg: ParseWorkerRequest) => void | Promise<void>): 
       onAck?.(raw.seq);
       return;
     }
-    if (typeof raw === 'object' && raw !== null && 'type' in raw && raw.type === 'session-images') {
+    if (typeof raw === 'object' && raw !== null && 'type' in raw && (raw.type === 'session-images' || raw.type === 'session-detail')) {
       try {
-        if (!isSessionImagesRequest(raw)) throw new Error('Invalid image extraction request');
-        send({ type: 'session-images', images: extractSourceImages(raw.source, raw.sessionId, raw.requestId) });
+        if (!isSessionSourceRequest(raw)) throw new Error('Invalid session source request');
+        if (raw.type === 'session-images') {
+          send({ type: 'session-images', images: extractSourceImages(raw.source, raw.sessionId, raw.requestId) });
+        } else {
+          send({ type: 'session-detail', session: loadSourceSession(raw.source, raw.sessionId) });
+        }
       } catch (error) {
         send({ type: 'error', message: error instanceof Error ? error.message : String(error) });
       }

@@ -33,7 +33,7 @@ import {
   recordCreatedContent,
 } from './edit-tool-diff';
 import { recordedToolFiles, recordedInvestigation, recordedWebDomains } from './curiosity-activity';
-import { imageReferencesFromCodex, type ImageCollector, type ImageReference } from './image-data';
+import { imageReferencesFromCodex, mergeImageReferences, type ImageCollector, type ImageReference } from './image-data';
 import type { SessionSource } from './cache';
 
 interface CodexLine {
@@ -62,6 +62,7 @@ interface CodexParseState {
   currentImageCount: number;
   currentImages: ImageReference[];
   hasUserResponseItem: boolean;
+  hasUserMessageEvent: boolean;
   collectImages?: ImageCollector;
   currentAssistantTexts: string[];
   currentToolsUsed: string[];
@@ -154,6 +155,7 @@ function createCodexState(initialModel: string, editLocIndex?: EditLocIndex, col
     currentImageCount: 0,
     currentImages: [],
     hasUserResponseItem: false,
+    hasUserMessageEvent: false,
     collectImages,
     currentAssistantTexts: [],
     currentToolsUsed: [],
@@ -269,6 +271,7 @@ function flushCodexTurn(state: CodexParseState, defaultModel: string): void {
   state.currentImageCount = 0;
   state.currentImages = [];
   state.hasUserResponseItem = false;
+  state.hasUserMessageEvent = false;
   state.currentAssistantTexts = [];
   state.currentToolsUsed = [];
   state.investigationDelegations = [];
@@ -393,10 +396,34 @@ function collectCodexImages(payload: Record<string, unknown>, state: CodexParseS
   // A turn can be recorded as both event_msg and response_item. They describe
   // the same attachments, not two separate sets of screenshots.
   state.currentImageCount = Math.max(state.currentImageCount, images.length);
-  if (state.collectImages && (images.length > state.currentImages.length
-    || (images.length === state.currentImages.length && images.some(image => image.data !== undefined)))) {
-    state.currentImages = images;
+  if (state.collectImages) state.currentImages = mergeImageReferences(state.currentImages, images);
+}
+
+function prepareCodexUserTurn(
+  state: CodexParseState,
+  text: string,
+  ts: number | null,
+  defaultModel: string,
+  recordType: 'event' | 'response',
+  imageCount: number,
+): void {
+  const hasTurn = state.currentUserMessage.length > 0 || state.currentImageCount > 0;
+  const hasImages = imageCount > 0 || state.currentImageCount > 0;
+  const mirror = recordType === 'event'
+    ? state.hasUserResponseItem && !state.hasUserMessageEvent
+    : state.hasUserMessageEvent && !state.hasUserResponseItem;
+  const samePrompt = state.currentUserMessage === text || (hasImages && (!state.currentUserMessage || !text));
+  const legacyDuplicate = recordType === 'event' && state.hasUserMessageEvent && !hasImages;
+  if (hasTurn && samePrompt && isTurnEmpty(state) && (mirror || legacyDuplicate)) {
+    if (state.turnStartTs === null) state.turnStartTs = ts;
+    if (!state.currentUserMessage) state.currentUserMessage = text;
+  } else {
+    flushCodexTurn(state, defaultModel);
+    state.currentUserMessage = text;
+    state.turnStartTs = ts;
   }
+  if (recordType === 'event') state.hasUserMessageEvent = true;
+  else state.hasUserResponseItem = true;
 }
 
 function handleUserMessageEvent(payload: Record<string, unknown>, state: CodexParseState, ts: number | null, defaultModel: string): void {
@@ -404,15 +431,7 @@ function handleUserMessageEvent(payload: Record<string, unknown>, state: CodexPa
   // Harness-injected session-start context is recorded as a user message but is
   // not a real prompt; ignore it before flushing or mutating turn state.
   if (isHarnessInjectedContext(newMessage)) return;
-  if ((state.currentUserMessage || state.currentImageCount > 0) && state.currentUserMessage === newMessage && isTurnEmpty(state)) {
-    if (state.turnStartTs == null) state.turnStartTs = ts;
-    collectCodexImages(payload, state);
-    return;
-  }
-
-  flushCodexTurn(state, defaultModel);
-  state.currentUserMessage = newMessage;
-  state.turnStartTs = ts;
+  prepareCodexUserTurn(state, newMessage, ts, defaultModel, 'event', imageReferencesFromCodex(payload).length);
   collectCodexImages(payload, state);
 }
 
@@ -499,13 +518,8 @@ function handleUserResponseItem(payload: Record<string, unknown>, state: CodexPa
     .map(item => item.text)
     .join('\n');
   if (!text && imageReferencesFromCodex(payload).length === 0) return;
-  if ((!state.currentUserMessage && state.currentImageCount === 0) || !isTurnEmpty(state) || state.hasUserResponseItem) {
-    flushCodexTurn(state, defaultModel);
-    state.currentUserMessage = text;
-    state.turnStartTs = ts;
-  }
+  prepareCodexUserTurn(state, text, ts, defaultModel, 'response', imageReferencesFromCodex(payload).length);
   collectCodexImages(payload, state);
-  state.hasUserResponseItem = true;
 }
 
 function handleAssistantResponseItem(payload: Record<string, unknown>, state: CodexParseState): void {

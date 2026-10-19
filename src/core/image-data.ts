@@ -10,8 +10,10 @@ import { assertTrustedPath } from './parser-shared';
 import { warnCore } from './log';
 
 export interface ImageReference {
+  id?: string;
   data?: unknown;
   path?: string;
+  alternatives?: ImageReference[];
 }
 
 export type ImageCollector = (requestId: string, images: ImageReference[]) => void;
@@ -37,6 +39,12 @@ function imageLocation(value: unknown): string | undefined {
   if (typeof value.external === 'string') return value.external;
   if (typeof value.fsPath === 'string') return value.fsPath;
   if (typeof value.path !== 'string') return undefined;
+  if (value.scheme === 'file') {
+    const url = new URL('file:///');
+    if (typeof value.authority === 'string') url.hostname = value.authority;
+    url.pathname = encodeURI(value.path).replaceAll('#', '%23').replaceAll('?', '%3F');
+    return url.href;
+  }
   if (typeof value.scheme === 'string' && value.scheme !== 'file') return `${value.scheme}:${value.path}`;
   if (typeof value.authority === 'string' && value.authority) return `//${value.authority}${value.path}`;
   return value.path;
@@ -46,15 +54,17 @@ function reference(value: Record<string, unknown>): ImageReference {
   const source = isRecord(value.source) ? value.source : {};
   const url = isRecord(value.image_url) ? value.image_url.url : value.image_url;
   const location = imageLocation(typeof value.scheme === 'string' ? value
-    : value.path ?? value.fileUrl ?? value.uri ?? value.url ?? value.external ?? url ?? source.url);
+    : value.path ?? value.fsPath ?? value.fileUrl ?? value.uri ?? value.url ?? value.external ?? url ?? source.url);
   const data = source.data ?? value.data ?? value.value;
-  if (typeof location === 'string' && location.startsWith('data:')) return { data: location };
-  if (typeof data === 'string' && !data.startsWith('data:') && imagePath(data)) return { path: data };
-  return data === undefined ? { path: location } : { data };
+  const id = typeof value.file_id === 'string' ? value.file_id : undefined;
+  if (typeof location === 'string' && location.startsWith('data:')) return { id, data: location };
+  if (typeof data === 'string' && !data.startsWith('data:') && imagePath(data)) return { id, path: data };
+  return data === undefined ? { id, path: location } : { id, data };
 }
 
 export function imageReferencesFromVariables(value: unknown): ImageReference[] {
   return records(value).filter(v => v.kind === 'image').map(v => {
+    if (v.data !== undefined) return reference(v);
     const data = v.value;
     if (isRecord(data) && ['data', 'uri', 'path', 'external', 'fsPath'].some(key => key in data)) {
       return reference(data);
@@ -88,13 +98,46 @@ export function imageReferencesFromCodex(payload: Record<string, unknown>): Imag
     if (typeof value === 'string') images.push({ data: value });
   }
   for (const value of Array.isArray(payload.file_ids) ? payload.file_ids : []) {
-    if (typeof value === 'string') images.push({});
+    if (typeof value === 'string') images.push({ id: value });
   }
   for (const value of Array.isArray(payload.local_images) ? payload.local_images : []) {
     if (typeof value === 'string') images.push({ path: value });
     else if (isRecord(value)) images.push(reference(value));
   }
   return images;
+}
+
+function imageCandidates(image: ImageReference): ImageReference[] {
+  const { alternatives, ...primary } = image;
+  return [primary, ...alternatives ?? []];
+}
+
+function sameImage(first: ImageReference, second: ImageReference): boolean {
+  return (first.id !== undefined && first.id === second.id)
+    || (first.path !== undefined && first.path === second.path)
+    || (first.data !== undefined && first.data === second.data);
+}
+
+export function mergeImageReferences(previous: ImageReference[], incoming: ImageReference[]): ImageReference[] {
+  const result = [...previous];
+  const unmatched = new Set(previous.map((_image, index) => index));
+  const matches = incoming.map(image => {
+    const index = previous.findIndex((existing, index) => unmatched.has(index)
+      && imageCandidates(existing).some(first => imageCandidates(image).some(second => sameImage(first, second))));
+    if (index >= 0) unmatched.delete(index);
+    return index;
+  });
+  for (const [index, image] of incoming.entries()) {
+    // Match stable identities first, then pair remaining mirror slots in order.
+    // Keep alternate payloads so incomplete mirrors cannot discard local data.
+    const target = matches[index] >= 0 ? matches[index] : unmatched.values().next().value ?? result.length;
+    unmatched.delete(target);
+    const candidates = [...imageCandidates(image), ...(result[target] ? imageCandidates(result[target]) : [])];
+    const quality = (candidate: ImageReference): number => candidate.data !== undefined ? 2 : candidate.path ? 1 : 0;
+    candidates.sort((first, second) => quality(second) - quality(first));
+    result[target] = { ...candidates[0], alternatives: candidates.slice(1) };
+  }
+  return result;
 }
 
 function imageMime(bytes: Uint8Array): string | null {
@@ -149,9 +192,11 @@ function readImageFile(location: string, baseDir: string, workspaceRootPath?: st
   if (filePath.startsWith('\\\\') || filePath.startsWith('//')) throw new Error('Remote image files are not supported');
   if (filePath.replaceAll('\\', '/').split('/').includes('..')) throw new Error('Image path traversal detected');
   filePath = path.resolve(workspaceRootPath || baseDir, filePath);
+  if (filePath.startsWith('\\\\') || filePath.startsWith('//')) throw new Error('Remote image files are not supported');
   const roots = workspaceRootPath ? [workspaceRootPath] : [];
   assertTrustedPath(filePath, roots);
   const resolved = fs.realpathSync(filePath);
+  if (resolved.startsWith('\\\\') || resolved.startsWith('//')) throw new Error('Remote image files are not supported');
   assertTrustedPath(resolved, roots);
   const fd = fs.openSync(resolved, 'r');
   try {
@@ -170,24 +215,32 @@ function readImageFile(location: string, baseDir: string, workspaceRootPath?: st
   }
 }
 
-export function loadImageReferences(images: ImageReference[], baseDir: string, workspaceRootPath?: string): string[] {
-  const result: string[] = [];
-  for (const image of images) {
-    if (result.length >= MAX_IMAGES_PER_REQUEST) break;
+function loadImageReference(image: ImageReference, baseDir: string, workspaceRootPath?: string): string | null {
+  for (const candidate of imageCandidates(image)) {
     try {
-      const bytes = image.path
-        ? readImageFile(image.path, baseDir, workspaceRootPath)
-        : imageBytes(image.data);
+      const bytes = candidate.path
+        ? readImageFile(candidate.path, baseDir, workspaceRootPath)
+        : imageBytes(candidate.data);
       if (!bytes) {
         warnCore('image-extract', 'Image reference has no recorded data or local file');
         continue;
       }
       const mime = imageMime(bytes);
       if (!mime) throw new Error('Unsupported image data');
-      result.push(`data:${mime};base64,${Buffer.from(bytes).toString('base64')}`);
+      return `data:${mime};base64,${Buffer.from(bytes).toString('base64')}`;
     } catch (error) {
       warnCore('image-extract', 'Could not load a local image', error);
     }
+  }
+  return null;
+}
+
+export function loadImageReferences(images: ImageReference[], baseDir: string, workspaceRootPath?: string): string[] {
+  const result: string[] = [];
+  for (const image of images) {
+    if (result.length >= MAX_IMAGES_PER_REQUEST) break;
+    const uri = loadImageReference(image, baseDir, workspaceRootPath);
+    if (uri) result.push(uri);
   }
   return result;
 }
