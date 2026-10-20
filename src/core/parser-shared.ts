@@ -31,9 +31,10 @@ export function assertTrustedPath(filePath: string, additionalRoots: readonly st
   }
 
   const trustedRoots = [...getTrustedRoots(), ...additionalRoots.filter(root => path.isAbsolute(root)).map(root => path.resolve(root))];
-  const compare = (value: string): string => process.platform === 'win32' ? value.toLowerCase() : value;
-  const candidate = compare(normalized);
-  const isTrusted = trustedRoots.some(root => candidate.startsWith(compare(root) + path.sep) || candidate === compare(root));
+  const isTrusted = trustedRoots.some(root => {
+    const relative = path.relative(root, normalized);
+    return relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  });
   if (!isTrusted) {
     throw new Error(`Path is outside trusted directories: ${filePath}`);
   }

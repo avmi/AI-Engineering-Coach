@@ -229,7 +229,8 @@ function readImageFile(location: string, baseDir: string, workspaceRootPath?: st
   const resolved = fs.realpathSync(filePath);
   assertLocalImagePath(resolved);
   assertTrustedPath(resolved, canonicalRoots);
-  const fd = fs.openSync(resolved, 'r');
+  // A FIFO must not block before its descriptor can be rejected as a non-file.
+  const fd = fs.openSync(resolved, fs.constants.O_RDONLY | (process.platform === 'win32' ? 0 : fs.constants.O_NONBLOCK));
   try {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || stat.size > MAX_IMAGE_BYTES) throw new Error('Image is not a file or exceeds the 10 MB limit');

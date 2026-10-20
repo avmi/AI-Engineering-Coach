@@ -7,6 +7,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
+import { execFileSync } from 'child_process';
+import { buildSync } from 'esbuild';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   imageReferencesFromAttachments,
@@ -67,6 +69,56 @@ describe('local image representations', () => {
       ...imageReferencesFromXcode([{ data: base64, fileUrl: 'file:///deleted-image.png' }]),
     ];
     expect(loadImageReferences(references, root)).toEqual([image, image, image, image]);
+  });
+
+  it('opens image files without blocking before checking the descriptor file type', () => {
+    const file = path.join(root, 'screenshot.png');
+    fs.writeFileSync(file, Buffer.from(bytes));
+    const open = fs.openSync;
+    const flags = fs.constants.O_RDONLY | (process.platform === 'win32' ? 0 : fs.constants.O_NONBLOCK);
+    const opened = vi.spyOn(fs, 'openSync').mockImplementationOnce((target, mode) => open(target, mode));
+    const read = vi.spyOn(fs, 'readSync');
+    const close = vi.spyOn(fs, 'closeSync');
+    vi.spyOn(fs, 'fstatSync').mockReturnValue(fs.statSync(root));
+    expect(loadImageReferences([{ path: file }, { data: base64 }], root)).toEqual([image]);
+    expect(opened).toHaveBeenCalledOnce();
+    expect(opened).toHaveBeenCalledWith(file, flags);
+    expect(read).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledWith(opened.mock.results[0].value);
+  });
+
+  it.skipIf(process.platform === 'win32').each([false, true])('rejects FIFO images promptly even when replaced during open (replace=%s)', replaceDuringOpen => {
+    const file = path.join(root, 'screenshot.png');
+    if (replaceDuringOpen) fs.writeFileSync(file, Buffer.from(bytes));
+    else execFileSync('mkfifo', [file], { cwd: os.tmpdir(), timeout: 5_000 });
+    const bundle = path.join(root, 'image-data.cjs');
+    const built = buildSync({
+      entryPoints: [path.resolve('src', 'core', 'image-data.ts')],
+      bundle: true, platform: 'node', format: 'cjs', write: false,
+    });
+    fs.writeFileSync(bundle, built.outputFiles[0].text);
+    const script = `
+      const { loadImageReferences } = require(process.argv[1]);
+      const fs = require('fs');
+      const file = fs.realpathSync(process.argv[2]);
+      if (process.argv[5] === 'true') {
+        const open = fs.openSync;
+        fs.openSync = (target, flags) => {
+          if (target === file) {
+            fs.unlinkSync(file);
+            require('child_process').execFileSync('mkfifo', [file]);
+          }
+          return open(target, flags);
+        };
+      }
+      const images = loadImageReferences([{ path: file }, { data: process.argv[4] }], process.argv[3]);
+      require('assert/strict').equal(fs.statSync(file).isFIFO(), true);
+      process.stdout.write(JSON.stringify(images));
+    `;
+    const result = execFileSync(process.execPath, ['-e', script, bundle, file, root, base64, String(replaceDuringOpen)], {
+      cwd: os.tmpdir(), encoding: 'utf-8', timeout: 5_000, killSignal: 'SIGKILL', stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    expect(JSON.parse(result)).toEqual([image]);
   });
 
   it('loads fsPath variables and serialized file URI objects', () => {

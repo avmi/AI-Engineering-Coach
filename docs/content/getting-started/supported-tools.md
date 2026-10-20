@@ -67,6 +67,8 @@ Claude fallback request IDs are scoped to their transcript so parent and subagen
 
 An attachment can still be counted when its original file has been deleted, its payload was not retained, or it exceeds the size limit. Such attachments cannot be displayed. Remote image URLs and network shares are never fetched, and SVG content is not rendered. Session logs and attachment files are never modified.
 
+Only regular local attachment files are read. Special files such as named pipes are rejected without waiting for data. Filesystem-root workspaces, including Windows drive roots, use the same local-file validation.
+
 ## Workspace Filtering
 
 You can filter analytics to a single workspace or view aggregated data across all workspaces. The bottom-left panel in the UI provides workspace and harness selectors.
