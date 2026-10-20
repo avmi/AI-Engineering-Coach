@@ -9,7 +9,7 @@ import { DateFilter, DailyActivity, PRACTICE_GROUPS, AntiPatternData, WorkflowOp
 import { FF_TOKEN_REPORTING_ENABLED } from '../core/constants';
 import { rpc, rpcAllSettled, createChart, formatNum, COLORS, PALETTE, harnessColor, destroyChartById, scoreColor, scoreLabel } from './shared';
 import { html, render, CanvasEl, ScoreRing, PctBadge } from './render';
-import { setSkillCache, getSkillCache } from './skill-cache';
+import { clearSkillCache, setSkillCache, getSkillCache } from './skill-cache';
 import { llmAvailable } from './capabilities';
 
 // Module-level view state — survives filter/harness changes.
@@ -317,6 +317,7 @@ function renderSkillResults(
   triaged: import('../core/types').TriagedCluster[],
   clusters: import('../core/types').WorkflowCluster[],
   catalogMatches: import('../core/types').CatalogItem[],
+  catalogError?: string,
 ): void {
   const contentEl = document.getElementById('dashSkillContent');
   if (!contentEl) return;
@@ -327,7 +328,7 @@ function renderSkillResults(
   const hasCustom = strong.length > 0;
   const hasCatalog = catTop.length > 0;
 
-  if (!hasCustom && !hasCatalog) {
+  if (!hasCustom && !hasCatalog && !catalogError) {
     render(html`<p style="color:var(--text-muted);margin:0;font-size:13px;">No skill opportunities found. Your prompts may already be well-served or too diverse.</p>
       <div style="text-align:center;margin-top:10px;"><a href="#" data-page="skills" style=${'font-size:12px;color:' + COLORS.blue + ';text-decoration:none;'}>Open Skill Finder for full analysis \u2192</a></div>`, contentEl);
     return;
@@ -355,7 +356,9 @@ function renderSkillResults(
               ${catTop.map(item => html`<${SkillCard} title=${item.title} subtitle=${item.description?.substring(0, 80) || item.kind} />`)}
               ${catalogMatches.length > 2 && html`<div style="font-size:11px;color:var(--text-muted);text-align:center;">+${catalogMatches.length - 2} more</div>`}
             </div>`
-          : html`<p style="color:var(--text-muted);margin:0;font-size:12px;">None matched</p>`}
+          : catalogError
+            ? html`<div><p class="sk-error">Catalog error: ${catalogError}</p><button id="dashScanBtn" class="dash-scan-btn">Retry Scan</button></div>`
+            : html`<p style="color:var(--text-muted);margin:0;font-size:12px;">None matched</p>`}
       </div>
     </div>
     <div style="text-align:center;margin-top:10px;">
@@ -380,6 +383,8 @@ async function loadDashSkills(currentFilter: DateFilter): Promise<void> {
 
     let triagedResults: import('../core/types').TriagedCluster[] = [];
     let catalogMatches: import('../core/types').CatalogItem[] = [];
+    let catalogTotalScanned = 0;
+    let catalogError: string | undefined;
 
     if (clusters.length > 0) {
       contentEl.querySelector('p')!.textContent = 'AI triage in progress...';
@@ -395,7 +400,10 @@ async function loadDashSkills(currentFilter: DateFilter): Promise<void> {
       // Run custom triage and catalog discovery in parallel
       const [triageResult, catResult] = await Promise.all([
         rpc<SkillTriageResult>('triageSkills', { clusters: topClusters } as Record<string, unknown>).catch(() => null),
-        rpc<CatalogDiscoverResult>('discoverCatalog', {} as Record<string, unknown>).catch(() => null),
+        rpc<CatalogDiscoverResult>('discoverCatalog', {} as Record<string, unknown>).catch((error: unknown) => {
+          catalogError = error instanceof Error ? error.message : 'Failed to load catalog';
+          return null;
+        }),
       ]);
 
       if (triageResult) {
@@ -404,6 +412,7 @@ async function loadDashSkills(currentFilter: DateFilter): Promise<void> {
 
       // Triage catalog if available
       if (catResult?.items && catResult.items.length > 0) {
+        catalogTotalScanned = catResult.totalScanned;
         contentEl.querySelector('p')!.textContent = 'Matching community catalog...';
         try {
           const triaged = await rpc<CatalogTriageResult>('triageCatalog', {
@@ -414,12 +423,23 @@ async function loadDashSkills(currentFilter: DateFilter): Promise<void> {
             })),
           } as Record<string, unknown>);
           catalogMatches = triaged.items || [];
-        } catch { /* catalog triage failed */ }
+        } catch (error: unknown) {
+          catalogError = error instanceof Error ? error.message : 'AI catalog triage failed';
+        }
+      } else if (catResult) {
+        catalogError = 'Community catalog returned no items. Please try again.';
       }
     }
 
-    setSkillCache({ clusters, triaged: triagedResults, catalogMatches, timestamp: Date.now() }, currentFilter);
-    renderSkillResults(triagedResults, clusters, catalogMatches);
+    if (catalogError) {
+      clearSkillCache(currentFilter);
+    } else {
+      setSkillCache({ clusters, triaged: triagedResults, catalogMatches, catalogTotalScanned, timestamp: Date.now() }, currentFilter);
+    }
+    renderSkillResults(triagedResults, clusters, catalogMatches, catalogError);
+    document.getElementById('dashScanBtn')?.addEventListener('click', () => {
+      void loadDashSkills(currentFilter);
+    });
   } catch {
     render(html`<p style="color:var(--text-muted);margin:0;font-size:13px;">Scan failed. Try again later.</p>`, contentEl);
   }

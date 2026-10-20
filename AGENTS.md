@@ -73,15 +73,21 @@ every PR. Run those locally before pushing.
 
 ## Skills
 
-Repo-specific instructions for recurring tasks live in [`skills/`](skills/). They are symlinked
-into [`.claude/skills/`](.claude/skills/) and [`.github/instructions/`](.github/instructions/)
-so popular agent harnesses pick them up automatically. See
+Repo-specific instructions for recurring tasks live in [`skills/`](skills/). Folder-based
+entry points in [`.github/skills/`](.github/skills/) and [`.claude/skills/`](.claude/skills/)
+make issue analysis discoverable; existing file-based skills use legacy aliases in
+`.claude/skills/` and [`.github/instructions/`](.github/instructions/). See
 [`skills/README.md`](skills/README.md) for the authoring format.
 
 Available today:
 
+- [`skills/analyze-issue.md`](skills/analyze-issue.md) — assess an issue, bug, or feature request
+  against the current branch, including fixed status, impact, compatibility, and effort.
 - [`skills/update-docs.md`](skills/update-docs.md) — author or update a Hugo doc page.
 - [`skills/package-extension.md`](skills/package-extension.md) — produce an installable `.vsix`.
+
+Use `analyze-issue` when asked to analyze or triage an issue, bug, or feature request; do not
+implement the underlying change unless the user explicitly asks for implementation.
 
 ## Rule and metric authoring
 
