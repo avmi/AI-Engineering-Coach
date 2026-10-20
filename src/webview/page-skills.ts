@@ -143,7 +143,9 @@ function renderCachedResults(
 /* ── Analysis Flow ────────────────────────────────────────────────── */
 
 async function runAnalysis(): Promise<void> {
-  const btn = document.getElementById('analyzeBtn') as HTMLButtonElement;
+  const btn = document.querySelector<HTMLButtonElement>('#analyzeBtn');
+  if (!btn || btn.disabled) return;
+  const current = () => document.getElementById('analyzeBtn') === btn;
   const statusEl = document.getElementById('analyzeStatus')!;
   const customEl = document.getElementById('customResults')!;
   const catalogEl = document.getElementById('catalogResults')!;
@@ -174,61 +176,69 @@ async function runAnalysis(): Promise<void> {
   let clusters: WorkflowCluster[] = [];
 
   try {
-    const data = await rpc<WorkflowOptimizationData>('getWorkflowOptimization', filter);
-    clusters = data.clusters || [];
+    try {
+      const data = await rpc<WorkflowOptimizationData>('getWorkflowOptimization', filter);
+      if (!current()) return;
+      clusters = data.clusters || [];
 
-    if (clusters.length === 0) {
-      render(html`<p class="sk-empty">No repeated patterns found. Try extending the lookback period or selecting a different workspace.</p>`, customEl);
-      render(html`<p class="sk-empty">No patterns to match against.</p>`, catalogEl);
-      return;
+      if (clusters.length === 0) {
+        render(html`<p class="sk-empty">No repeated patterns found. Try extending the lookback period or selecting a different workspace.</p>`, customEl);
+        render(html`<p class="sk-empty">No patterns to match against.</p>`, catalogEl);
+        return;
+      }
+
+      // Send top 20 most repeated clusters with full examples to AI
+      const top20 = clusters.slice(0, 20);
+      statusEl.textContent = `Found ${clusters.length} patterns \u2014 sending top ${top20.length} to AI triage...`;
+
+      const result = await rpc<SkillTriageResult>('triageSkills', {
+        clusters: top20.map(c => ({
+          id: c.id, label: c.label, occurrences: c.occurrences,
+          sessions: c.sessions, cancelRate: c.cancelRate,
+          avgCorrectionTurns: c.avgCorrectionTurns,
+          workspaces: c.workspaces,
+          examples: c.examples.slice(0, 5),
+        })),
+        workspace: workspaceName,
+      } as Record<string, unknown>);
+      if (!current()) return;
+
+      const strong = (result.triaged || []).filter(t => t.verdict === 'strong').slice(0, 10);
+      lastTriaged = strong;
+      lastClusters = clusters;
+      lastResultsEl = customEl;
+
+      if (strong.length === 0) {
+        statusEl.textContent = 'No strong skill opportunities found.';
+        render(html`<p class="sk-empty">No repeating agent tasks detected. Your prompts may already be well-served or too diverse.</p>`, customEl);
+      } else {
+        statusEl.textContent = `${strong.length} skill ${strong.length === 1 ? 'opportunity' : 'opportunities'} found`;
+        renderTriageResults(customEl, strong, clusters);
+      }
+    } catch (err: unknown) {
+      if (!current()) return;
+      const msg = err instanceof Error ? err.message : 'Analysis failed';
+      render(html`<p class="sk-error">Error: ${msg}</p>`, customEl);
     }
 
-    // Send top 20 most repeated clusters with full examples to AI
-    const top20 = clusters.slice(0, 20);
-    statusEl.textContent = `Found ${clusters.length} patterns \u2014 sending top ${top20.length} to AI triage...`;
-
-    const result = await rpc<SkillTriageResult>('triageSkills', {
-      clusters: top20.map(c => ({
-        id: c.id, label: c.label, occurrences: c.occurrences,
-        sessions: c.sessions, cancelRate: c.cancelRate,
-        avgCorrectionTurns: c.avgCorrectionTurns,
-        workspaces: c.workspaces,
-        examples: c.examples.slice(0, 5),
-      })),
-      workspace: workspaceName,
-    } as Record<string, unknown>);
-
-    const strong = (result.triaged || []).filter(t => t.verdict === 'strong').slice(0, 10);
-    lastTriaged = strong;
-    lastClusters = clusters;
-    lastResultsEl = customEl;
-
-    if (strong.length === 0) {
-      statusEl.textContent = 'No strong skill opportunities found.';
-      render(html`<p class="sk-empty">No repeating agent tasks detected. Your prompts may already be well-served or too diverse.</p>`, customEl);
+    // Load community catalog after custom analysis and write to shared cache
+    const catalog = await loadCatalog(catalogEl, clusters, current, workspaceName);
+    if (!current()) return;
+    if (catalog) {
+      setSkillCache({
+        clusters, triaged: lastTriaged, catalogMatches: catalog.items,
+        catalogTotalScanned: catalog.totalScanned, timestamp: Date.now(),
+      }, cacheFilter);
     } else {
-      statusEl.textContent = `${strong.length} skill ${strong.length === 1 ? 'opportunity' : 'opportunities'} found`;
-      renderTriageResults(customEl, strong, clusters);
+      clearSkillCache(cacheFilter);
     }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : 'Analysis failed';
-    render(html`<p class="sk-error">Error: ${msg}</p>`, customEl);
+    updateNavBadge('badge-skills', lastTriaged.length + (catalog?.items.length ?? 0));
   } finally {
-    btn.disabled = false;
-    btn.textContent = 'Analyze';
+    if (current()) {
+      btn.disabled = false;
+      btn.textContent = 'Analyze';
+    }
   }
-
-  // Load community catalog after custom analysis and write to shared cache
-  const catalog = await loadCatalog(catalogEl, clusters, workspaceName);
-  if (catalog) {
-    setSkillCache({
-      clusters, triaged: lastTriaged, catalogMatches: catalog.items,
-      catalogTotalScanned: catalog.totalScanned, timestamp: Date.now(),
-    }, cacheFilter);
-  } else {
-    clearSkillCache(cacheFilter);
-  }
-  updateNavBadge('badge-skills', lastTriaged.length + (catalog?.items.length ?? 0));
 }
 
 function triggerRunAnalysis(): void {
@@ -359,10 +369,16 @@ const kindColors: Record<string, string> = {
   instruction: COLORS.blue, hook: COLORS.yellow,
 };
 
-async function loadCatalog(container: HTMLElement, clusters: WorkflowCluster[], workspace?: string): Promise<CatalogDiscoverResult | undefined> {
+async function loadCatalog(
+  container: HTMLElement,
+  clusters: WorkflowCluster[],
+  current: () => boolean,
+  workspace?: string,
+): Promise<CatalogDiscoverResult | undefined> {
   try {
     // Fetch ALL catalog items (no pre-filtering)
     const result = await rpc<CatalogDiscoverResult>('discoverCatalog', {} as Record<string, unknown>);
+    if (!current()) return undefined;
     if (!result.items || result.items.length === 0) {
       throw new Error('Community catalog returned no items. Please try again.');
     }
@@ -379,6 +395,7 @@ async function loadCatalog(container: HTMLElement, clusters: WorkflowCluster[], 
       clusters: topClusters,
       workspace: workspace || undefined,
     } as Record<string, unknown>);
+    if (!current()) return undefined;
 
     const items = triaged.items && triaged.items.length > 0 ? triaged.items : [];
     if (items.length === 0) {
@@ -388,6 +405,7 @@ async function loadCatalog(container: HTMLElement, clusters: WorkflowCluster[], 
     }
     return { items, totalScanned: result.totalScanned };
   } catch (err: unknown) {
+    if (!current()) return undefined;
     const msg = err instanceof Error ? err.message : 'Failed to load catalog';
     render(html`<p class="sk-error">Catalog error: ${msg}</p>`, container);
     return undefined;

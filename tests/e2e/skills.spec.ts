@@ -8,6 +8,7 @@ type CatalogScenario = 'success' | 'discovery-error' | 'empty-catalog' | 'triage
 type MockWindow = Window & {
   getMockData: (method: string, params: Record<string, unknown>) => unknown;
   catalogInstallParams?: Record<string, unknown>;
+  releaseSkillRequest?: () => void;
 };
 
 const workflow: WorkflowOptimizationData = {
@@ -89,6 +90,38 @@ async function analyzeSkills(page: Page): Promise<void> {
   await expect(page.locator('#customResults')).toContainText('run-focused-tests');
 }
 
+async function holdSkillRequest(page: Page, method: 'discoverCatalog' | 'triageCatalog'): Promise<void> {
+  await page.evaluate(method => {
+    const root = window as MockWindow;
+    const original = root.getMockData;
+    let pending = true;
+    root.releaseSkillRequest = undefined;
+    root.getMockData = (name, params) => {
+      if (name === method && pending) {
+        pending = false;
+        return new Promise(resolve => {
+          root.releaseSkillRequest = () => resolve({ error: 'Stale catalog failure' });
+        });
+      }
+      return original(name, params);
+    };
+  }, method);
+}
+
+async function failHeldSkillRequest(page: Page): Promise<void> {
+  await page.evaluate(() => new Promise<void>(resolve => {
+    const root = window as MockWindow;
+    if (!root.releaseSkillRequest) throw new Error('No pending skill request');
+    const delivered = (event: MessageEvent) => {
+      if (event.data?.type !== 'response' || event.data.data?.error !== 'Stale catalog failure') return;
+      window.removeEventListener('message', delivered);
+      setTimeout(resolve, 0);
+    };
+    window.addEventListener('message', delivered);
+    root.releaseSkillRequest();
+  }));
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto(HARNESS_URL);
   await expect(page.locator('#dailyChart')).toBeVisible();
@@ -163,3 +196,63 @@ test('distinguishes a successfully reviewed catalog with no matches from a catal
   await openSkillFinder(page);
   await expect(results).toContainText('No community items matched your workflow patterns (3 reviewed).');
 });
+
+for (const scope of ['workspace', 'harness'] as const) {
+  test(`dashboard preserves the new ${scope} result when an older catalog request fails`, async ({ page }) => {
+    await mockSkillCatalog(page, 'success');
+    await holdSkillRequest(page, 'discoverCatalog');
+    await page.getByRole('button', { name: 'Scan for Skills', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => !!(window as MockWindow).releaseSkillRequest)).toBe(true);
+
+    if (scope === 'workspace') {
+      await page.locator('#ws-filter-input').fill('frontend-app');
+      await page.locator('#ws-filter-list [data-value="ws-2"]').click();
+    } else {
+      await page.locator('#harness-filter').selectOption('Claude Code');
+    }
+    await page.getByRole('button', { name: 'Scan for Skills', exact: true }).click();
+    await expect(page.locator('#dashSkillContent')).toContainText('Focused Testing');
+
+    await failHeldSkillRequest(page);
+    await expect(page.locator('#dashSkillContent')).toContainText('Focused Testing');
+    await expect(page.locator('#dashSkillContent .sk-error')).toHaveCount(0);
+    await openSkillFinder(page);
+    await expect(page.locator('#catalogResults .sk-section-count')).toHaveText('1 curated from 3 catalog items');
+  });
+}
+
+for (const method of ['discoverCatalog', 'triageCatalog'] as const) {
+  test(`Analyze stays disabled until ${method} finishes`, async ({ page }) => {
+    await mockSkillCatalog(page, 'success');
+    await holdSkillRequest(page, method);
+    await analyzeSkills(page);
+    await expect.poll(() => page.evaluate(() => !!(window as MockWindow).releaseSkillRequest)).toBe(true);
+    await expect(page.getByRole('button', { name: 'Analyzing...', exact: true })).toBeDisabled();
+
+    await failHeldSkillRequest(page);
+    await expect(page.locator('#catalogResults .sk-error')).toContainText('Stale catalog failure');
+    await expect(page.getByRole('button', { name: 'Analyze', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Analyze', exact: true }).click();
+    await expect(page.locator('#catalogResults .sk-section-count')).toHaveText('1 curated from 3 catalog items');
+  });
+
+  test(`a newer Skill Finder success survives an older ${method} failure`, async ({ page }) => {
+    await mockSkillCatalog(page, 'success');
+    await holdSkillRequest(page, method);
+    await analyzeSkills(page);
+    await expect.poll(() => page.evaluate(() => !!(window as MockWindow).releaseSkillRequest)).toBe(true);
+
+    await page.locator('#sidebar [data-page="dashboard"]').click();
+    await expect(page.locator('#dailyChart')).toBeVisible();
+    await analyzeSkills(page);
+    await expect(page.locator('#catalogResults .sk-section-count')).toHaveText('1 curated from 3 catalog items');
+
+    await failHeldSkillRequest(page);
+    await expect(page.locator('#catalogResults .sk-section-count')).toHaveText('1 curated from 3 catalog items');
+    await expect(page.locator('#catalogResults .sk-error')).toHaveCount(0);
+    await page.locator('#sidebar [data-page="dashboard"]').click();
+    await expect(page.locator('#dashSkillContent')).toContainText('Focused Testing');
+    await openSkillFinder(page);
+    await expect(page.locator('#catalogResults .sk-section-count')).toHaveText('1 curated from 3 catalog items');
+  });
+}

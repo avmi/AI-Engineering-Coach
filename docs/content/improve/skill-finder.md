@@ -42,6 +42,10 @@ the dashboard, to retry without restarting VS Code. Failed results are not cache
 successful results retain the full reviewed-item count when navigating between
 the dashboard and Skill Finder.
 
+Analyze stays disabled until both custom-skill analysis and catalog matching
+finish. Switching the workspace, harness, or page leaves the new view's results
+and cache isolated from any requests still finishing for the previous view.
+
 ## Configuration
 
 You can select the workspace and look-back period (1 month, 3 months, 6 months) to control the scope of the analysis. Click **Analyze** to refresh the findings.

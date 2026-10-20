@@ -369,8 +369,10 @@ function renderSkillResults(
 /* ── Skill scan ───────────────────────────────────────────────────── */
 
 async function loadDashSkills(currentFilter: DateFilter): Promise<void> {
+  const filter = { ...currentFilter };
   const contentEl = document.getElementById('dashSkillContent');
   if (!contentEl) return;
+  const current = () => document.getElementById('dashSkillContent') === contentEl;
 
   render(html`<div style="text-align:center;padding:8px;">
     <div class="loading-spinner" style="width:24px;height:24px;margin:0 auto 8px;"></div>
@@ -378,7 +380,8 @@ async function loadDashSkills(currentFilter: DateFilter): Promise<void> {
   </div>`, contentEl);
 
   try {
-    const data = await rpc<WorkflowOptimizationData>('getWorkflowOptimization', currentFilter as Record<string, unknown>);
+    const data = await rpc<WorkflowOptimizationData>('getWorkflowOptimization', filter);
+    if (!current()) return;
     const clusters = data.clusters || [];
 
     let triagedResults: import('../core/types').TriagedCluster[] = [];
@@ -405,6 +408,7 @@ async function loadDashSkills(currentFilter: DateFilter): Promise<void> {
           return null;
         }),
       ]);
+      if (!current()) return;
 
       if (triageResult) {
         triagedResults = (triageResult.triaged || []).filter(t => t.verdict === 'strong');
@@ -431,16 +435,18 @@ async function loadDashSkills(currentFilter: DateFilter): Promise<void> {
       }
     }
 
+    if (!current()) return;
     if (catalogError) {
-      clearSkillCache(currentFilter);
+      clearSkillCache(filter);
     } else {
-      setSkillCache({ clusters, triaged: triagedResults, catalogMatches, catalogTotalScanned, timestamp: Date.now() }, currentFilter);
+      setSkillCache({ clusters, triaged: triagedResults, catalogMatches, catalogTotalScanned, timestamp: Date.now() }, filter);
     }
     renderSkillResults(triagedResults, clusters, catalogMatches, catalogError);
     document.getElementById('dashScanBtn')?.addEventListener('click', () => {
-      void loadDashSkills(currentFilter);
+      void loadDashSkills(filter);
     });
   } catch {
+    if (!current()) return;
     render(html`<p style="color:var(--text-muted);margin:0;font-size:13px;">Scan failed. Try again later.</p>`, contentEl);
   }
 }
