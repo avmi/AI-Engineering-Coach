@@ -25,6 +25,7 @@ import {
   recordCreatedContent,
 } from './edit-tool-diff';
 import { recordedTools, recordedToolFiles, recordedInvestigation, recordedWebDomains } from './curiosity-activity';
+import { imageReferencesFromAttachments, imageReferencesFromVariables, imageRequestIndex, type ImageReference, type ImageRequestMatch } from './image-data';
 
 interface CLIEvent {
   type: string;
@@ -215,18 +216,6 @@ function addAttachmentReferences(turn: TurnState, attachments: unknown): void {
   for (const attachment of recordArrayValue(attachments)) {
     const filePath = attachment.path;
     if (typeof filePath === 'string') turn.referencedFiles.add(filePath);
-    // Count image attachments
-    const mimeType = typeof attachment.mimeType === 'string' ? attachment.mimeType : '';
-    const type = typeof attachment.type === 'string' ? attachment.type : '';
-    if (type === 'image' || mimeType.startsWith('image/')) {
-      turn.imageCount++;
-    }
-  }
-}
-
-function countImageVariables(turn: TurnState, variables: unknown): void {
-  for (const v of recordArrayValue(variables)) {
-    if (v.kind === 'image') turn.imageCount++;
   }
 }
 
@@ -261,8 +250,11 @@ function handleUserMessage(ev: CLIEvent, state: CLIParseState): void {
     || /^[ \t]*(?:from|sender)(?:_[a-z]+)+[ \t]*[:=]/im.test(injected);
   state.turn.userEventId = ev.id;
   addAttachmentReferences(state.turn, ev.data?.attachments);
-  // Also count images from variables array (same format as VS Code sessions)
-  countImageVariables(state.turn, ev.data?.variables);
+  const images = [
+    ...imageReferencesFromAttachments(ev.data?.attachments),
+    ...imageReferencesFromVariables(ev.data?.variables),
+  ];
+  state.turn.imageCount = images.length;
 }
 
 function handleToolExecutionStart(ev: CLIEvent, state: CLIParseState): void {
@@ -496,7 +488,7 @@ function finalizeCliSession(
     workspaceName: wsName,
     location: 'cli',
     harness: harnessName(state),
-    creationDate: creationDate ?? undefined,
+    ...(creationDate === null ? {} : { creationDate }),
     requests: state.requests,
     modelUsage: state.modelUsage,
     endReason: state.sawShutdown ? 'shutdown' : 'active',
@@ -536,6 +528,45 @@ export function parseCLIEventsFile(
   if (!sawAnyEvent) return null;
 
   return finalizeCliSession(state, wsId, wsName, customInstructionsBytes);
+}
+
+export function extractCLIImageReferences(
+  eventsPath: string,
+  sessionId: string,
+  requestId: string,
+  match?: ImageRequestMatch,
+): ImageReference[] {
+  const userEventId = match?.userEventId;
+  const requestIndex = imageRequestIndex(sessionId, requestId, 'cli', match);
+  let currentIndex = -1;
+  let current: ImageReference[] = [];
+  let images: ImageReference[] = [];
+  let done = false;
+  forEachJsonlLine(eventsPath, line => {
+    if (!line.includes('"user.message"') && !line.includes('"session.start"')
+      && (userEventId || requestIndex !== null || !line.includes('"assistant.message"'))) return;
+    const event = parseCLIEventLine(line);
+    if (!event) return;
+    if (event.type === 'session.start' && typeof event.data?.sessionId === 'string' && event.data.sessionId !== sessionId) {
+      done = true;
+      return;
+    }
+    if (event.type === 'user.message') {
+      currentIndex++;
+      current = [
+        ...imageReferencesFromAttachments(event.data?.attachments),
+        ...imageReferencesFromVariables(event.data?.variables),
+      ];
+      if (userEventId ? event.id === userEventId : currentIndex === requestIndex) {
+        images = current;
+        done = true;
+      }
+    } else if (!userEventId && requestIndex === null && event.type === 'assistant.message' && event.id === requestId) {
+      images = current;
+      done = true;
+    }
+  }, () => done);
+  return images;
 }
 
 /**
